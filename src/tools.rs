@@ -1,23 +1,32 @@
-//! Git, Rust (cargo) and the C++ build tools that building a project needs:
-//! found on the PATH or in the folders their installers use (a PATH changed
-//! after Windows started does not reach programs started before), and put
-//! on this PC with winget when the player asks.
+//! The tools a build needs: Git, Rust (cargo) and a C linker — found on the
+//! PATH or in the folders their installers use (a PATH changed after the
+//! session started does not reach programs started before). On Windows the
+//! missing ones are installed with winget; on Linux the command of the
+//! system's package manager is shown instead.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Mutex;
+
+use crate::platform;
+
+/// What a missing linker is called in the interface.
+#[cfg(windows)]
+const LINKER: &str = "C++ build tools";
+/// What a missing linker is called in the interface.
+#[cfg(not(windows))]
+const LINKER: &str = "C linker (cc)";
 
 #[derive(Clone, Default, Debug)]
 pub struct Tools {
     pub git: Option<PathBuf>,
     pub cargo: Option<PathBuf>,
-    /// The C++ build tools (MSVC): Rust needs their linker.
-    pub msvc: bool,
+    /// The C linker Rust links with: MSVC's on Windows, cc/gcc/clang on Linux.
+    pub linker: bool,
 }
 
 impl Tools {
     pub fn ready(&self) -> bool {
-        self.git.is_some() && self.cargo.is_some() && self.msvc
+        self.git.is_some() && self.cargo.is_some() && self.linker
     }
 
     /// What is missing, for people.
@@ -29,8 +38,8 @@ impl Tools {
         if self.cargo.is_none() {
             m.push("Rust");
         }
-        if !self.msvc {
-            m.push("C++ build tools");
+        if !self.linker {
+            m.push(LINKER);
         }
         m
     }
@@ -43,30 +52,23 @@ pub fn current() -> Option<Tools> {
     FOUND.lock().unwrap().clone()
 }
 
-fn env_path(var: &str) -> Option<PathBuf> {
-    std::env::var_os(var).map(PathBuf::from)
-}
-
-fn answers(program: &Path) -> bool {
-    let mut c = Command::new(program);
-    c.arg("--version").stdout(Stdio::null()).stderr(Stdio::null());
-    crate::hide_window(&mut c);
-    c.status().map(|s| s.success()).unwrap_or(false)
-}
-
 /// `name` on the PATH, else the first of `places` that exists and answers.
 fn find(name: &str, places: &[Option<PathBuf>]) -> Option<PathBuf> {
-    if answers(Path::new(name)) {
+    if platform::answers(Path::new(name)) {
         return Some(PathBuf::from(name));
     }
-    places.iter().flatten().find(|p| p.is_file() && answers(p)).cloned()
+    places.iter().flatten().find(|p| p.is_file() && platform::answers(p)).cloned()
 }
 
+/// Whether the C++ tools of Visual Studio (MSVC) are installed: every Visual
+/// Studio install (any edition, Build Tools too), from the installer's own
+/// list, else the usual folders.
+#[cfg(windows)]
 fn msvc_installed() -> bool {
-    // Every Visual Studio install (any edition, Build Tools too), from the
-    // installer's own list, else the usual folders.
+    use std::process::Command;
+
     let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(pf86) = env_path("ProgramFiles(x86)") {
+    if let Some(pf86) = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from) {
         let vswhere = pf86.join("Microsoft Visual Studio").join("Installer").join("vswhere.exe");
         if vswhere.is_file() {
             let mut c = Command::new(vswhere);
@@ -77,7 +79,7 @@ fn msvc_installed() -> bool {
             }
         }
     }
-    for base in [env_path("ProgramFiles"), env_path("ProgramFiles(x86)")].into_iter().flatten() {
+    for base in ["ProgramFiles", "ProgramFiles(x86)"].into_iter().filter_map(|v| std::env::var_os(v).map(PathBuf::from)) {
         let vs = base.join("Microsoft Visual Studio");
         for year in std::fs::read_dir(&vs).into_iter().flatten().flatten() {
             for edition in std::fs::read_dir(year.path()).into_iter().flatten().flatten() {
@@ -95,37 +97,34 @@ fn msvc_installed() -> bool {
     })
 }
 
+/// Whether the Rust compiler has a linker to link with.
+#[cfg(windows)]
+fn linker_installed() -> bool {
+    msvc_installed()
+}
+
+/// Whether the Rust compiler has a linker to link with.
+#[cfg(not(windows))]
+fn linker_installed() -> bool {
+    platform::has_linker()
+}
+
 /// Looks for the tools now.
 pub fn detect() -> Tools {
-    let pf = env_path("ProgramFiles");
-    let pf86 = env_path("ProgramFiles(x86)");
-    let local = env_path("LOCALAPPDATA");
-    let home = env_path("USERPROFILE");
-    let git = find(
-        "git",
-        &[
-            pf.as_ref().map(|p| p.join("Git").join("cmd").join("git.exe")),
-            pf86.as_ref().map(|p| p.join("Git").join("cmd").join("git.exe")),
-            local.as_ref().map(|p| p.join("Programs").join("Git").join("cmd").join("git.exe")),
-        ],
-    );
-    let cargo = find(
-        "cargo",
-        &[
-            env_path("CARGO_HOME").map(|p| p.join("bin").join("cargo.exe")),
-            home.as_ref().map(|p| p.join(".cargo").join("bin").join("cargo.exe")),
-        ],
-    );
-    let t = Tools { git, cargo, msvc: msvc_installed() };
+    let t = Tools {
+        git: find("git", &platform::git_places()),
+        cargo: find("cargo", &platform::cargo_places()),
+        linker: linker_installed(),
+    };
     *FOUND.lock().unwrap() = Some(t.clone());
     t
 }
 
 /// A command for a tool, by the path it was found at, with the tools'
 /// folders first on its PATH (cargo runs rustc and git from there).
-fn command(path: Option<PathBuf>, name: &str) -> Command {
+fn command(path: Option<PathBuf>, name: &str) -> std::process::Command {
     let program = path.unwrap_or_else(|| PathBuf::from(name));
-    let mut c = Command::new(&program);
+    let mut c = std::process::Command::new(&program);
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(t) = current() {
         for p in [t.git, t.cargo].into_iter().flatten() {
@@ -145,20 +144,28 @@ fn command(path: Option<PathBuf>, name: &str) -> Command {
     c
 }
 
-pub fn git() -> Command {
+pub fn git() -> std::process::Command {
     command(current().and_then(|t| t.git), "git")
 }
 
-pub fn cargo() -> Command {
+pub fn cargo() -> std::process::Command {
     command(current().and_then(|t| t.cargo), "cargo")
 }
 
 /// Whether winget (the Windows package manager) is there.
+#[cfg(windows)]
 pub fn has_winget() -> bool {
-    answers(Path::new("winget"))
+    platform::answers(Path::new("winget"))
+}
+
+/// Whether winget (the Windows package manager) is there.
+#[cfg(not(windows))]
+pub fn has_winget() -> bool {
+    false
 }
 
 /// The winget installs for what `t` lacks: (what, arguments).
+#[cfg(windows)]
 pub fn install_steps(t: &Tools) -> Vec<(&'static str, Vec<String>)> {
     let common = ["--exact", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements"];
     let mut steps = Vec::new();
@@ -171,7 +178,7 @@ pub fn install_steps(t: &Tools) -> Vec<(&'static str, Vec<String>)> {
     if t.git.is_none() {
         step("Git", "Git.Git", &["--silent"]);
     }
-    if !t.msvc {
+    if !t.linker {
         step(
             "C++ build tools",
             "Microsoft.VisualStudio.2022.BuildTools",
@@ -182,4 +189,17 @@ pub fn install_steps(t: &Tools) -> Vec<(&'static str, Vec<String>)> {
         step("Rust", "Rustlang.Rustup", &["--silent"]);
     }
     steps
+}
+
+/// The winget installs for what `t` lacks: (what, arguments).
+#[cfg(not(windows))]
+pub fn install_steps(_: &Tools) -> Vec<(&'static str, Vec<String>)> {
+    Vec::new()
+}
+
+/// The command that installs what `t` lacks with the system's package
+/// manager (`None` on Windows, where winget does it, or when no known
+/// manager is there).
+pub fn install_command(t: &Tools) -> Option<String> {
+    platform::install_command(t.git.is_none(), t.cargo.is_none(), !t.linker)
 }

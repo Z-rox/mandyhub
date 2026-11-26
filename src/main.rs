@@ -7,13 +7,14 @@
 //! - Play: the selected repo is downloaded (git), built (cargo) and started.
 //!
 //! No game files are included or downloaded: the player supplies their own.
-#![windows_subsystem = "windows"]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[allow(dead_code)]
 mod design;
 mod slides;
 mod look;
 mod fullscreen;
+mod platform;
 mod tools;
 
 use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
@@ -167,7 +168,8 @@ fn target_dir(repo: &str) -> PathBuf {
 fn built_exe(repo: &str) -> PathBuf {
     let dir = repo_dir(repo);
     let profile = detect_build_profile(&dir);
-    target_dir(repo).join(profile).join("victory.exe")
+    // A Windows build ends in .exe; a Linux build is a plain binary.
+    target_dir(repo).join(profile).join(format!("victory{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// Checks a cloned repo's Cargo.toml for a custom build profile (e.g. `diag`).
@@ -181,28 +183,91 @@ fn detect_build_profile(repo_dir: &Path) -> &'static str {
     "release"
 }
 
-/// Reads VICTORY_* environment variables from a project's scripts/play.ps1.
+/// Reads the VICTORY_* variables a project's launch script sets
+/// (`scripts/play.ps1` on Windows, `scripts/play.sh` on Linux): what the
+/// project itself suggests for its launch.
 fn detect_launch_env(repo_dir: &Path) -> Vec<(String, String)> {
-    let script = repo_dir.join("scripts").join("play.ps1");
-    let Ok(text) = std::fs::read_to_string(&script) else { return Vec::new() };
+    let scripts = repo_dir.join("scripts");
     let mut vars = Vec::new();
-    // Parse PowerShell hashtable lines like: VICTORY_FOO = '1'; VICTORY_BAR = '2'
-    // They appear inside $settings = @{ ... } and in conditional blocks.
+    if let Ok(text) = std::fs::read_to_string(scripts.join("play.ps1")) {
+        parse_powershell(&text, &mut vars);
+    }
+    for name in ["play.sh", "run.sh"] {
+        if let Ok(text) = std::fs::read_to_string(scripts.join(name)) {
+            parse_shell(&text, &mut vars);
+        }
+    }
+    // A variable set twice keeps its last value, as in the script itself.
+    let mut seen = std::collections::HashSet::new();
+    vars.reverse();
+    vars.retain(|(k, _)| seen.insert(k.clone()));
+    vars.reverse();
+    vars
+}
+
+/// PowerShell lines like `VICTORY_FOO = '1'; VICTORY_BAR = '2'`, inside
+/// `$settings = @{ ... }` or in conditional blocks.
+fn parse_powershell(text: &str, out: &mut Vec<(String, String)>) {
     for line in text.lines() {
         let line = line.trim().trim_end_matches(';').trim();
-        // Match lines containing VICTORY_ assignments with single-quoted values.
         for part in line.split(';') {
             let part = part.trim();
             if let Some((k, v)) = part.split_once('=') {
                 let k = k.trim().trim_start_matches("$settings.");
                 let v = v.trim().trim_matches('\'').trim_matches('"');
                 if k.starts_with("VICTORY_") && !k.contains(' ') {
-                    vars.push((k.to_string(), v.to_string()));
+                    out.push((k.to_string(), v.to_string()));
                 }
             }
         }
     }
-    vars
+}
+
+/// Shell lines like `export VICTORY_FOO=1` or `VICTORY_BAR="a b"`: the
+/// assignments are read, comments and mere mentions (`$VICTORY_X`,
+/// `--VICTORY_X`) are not, and a value that is a variable expansion is left
+/// out because it cannot be resolved here.
+fn parse_shell(text: &str, out: &mut Vec<(String, String)>) {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(pos) = rest.find("VICTORY_") {
+            // Only a name that starts a token is a setting; `$VICTORY_X` and
+            // `--VICTORY_X` are mentions.
+            if rest[..pos].chars().last().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '-') {
+                rest = &rest[pos + 1..];
+                continue;
+            }
+            let tail = &rest[pos..];
+            let Some(eq) = tail.find('=') else { return };
+            let name = &tail[..eq];
+            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                // `[ "$VICTORY_X" = "1" ]`: a comparison, not an assignment.
+                rest = &tail[eq + 1..];
+                continue;
+            }
+            let after = tail[eq + 1..].trim_start();
+            let quote = after.chars().next().filter(|c| *c == '\'' || *c == '"');
+            let (value, used) = match quote {
+                Some(q) => match after[1..].find(q) {
+                    Some(end) => (after[1..1 + end].to_string(), 1 + end + 1),
+                    None => return,
+                },
+                None => {
+                    let v = after.split(|c: char| c.is_whitespace() || c == ';' || c == '#').next().unwrap_or("");
+                    (v.to_string(), v.len())
+                }
+            };
+            // An empty value would blank a default of the project's.
+            if !value.is_empty() && !value.contains('$') {
+                out.push((name.to_string(), value));
+            }
+            rest = &after[used..];
+        }
+    }
 }
 /// The commit an installed build was made from, written after a build.
 fn built_file(repo: &str) -> PathBuf {
@@ -261,8 +326,7 @@ fn find_game_in(dir: &Path, depth: u32) -> Option<PathBuf> {
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_lowercase();
         // Not worth walking into.
-        let skip = ["windows", "program files", "program files (x86)", "programdata", "appdata"];
-        if name.starts_with('$') || name.starts_with('.') || skip.contains(&name.as_str()) {
+        if name.starts_with('$') || name.starts_with('.') || platform::skip_dirs().contains(&name.as_str()) {
             continue;
         }
         if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -274,24 +338,23 @@ fn find_game_in(dir: &Path, depth: u32) -> Option<PathBuf> {
     None
 }
 
-/// Every drive's folders, three levels down, for the game's exe.
+/// The home folder and the mounted drives, a few levels down, for the
+/// game's exe.
 fn search_drives() -> Result<String, String> {
-    for letter in b'C'..=b'Z' {
-        let root = PathBuf::from(format!("{}:\\", letter as char));
-        if !root.is_dir() {
-            continue;
-        }
-        if let Some(found) = find_game_in(&root, 3) {
+    for root in platform::search_roots() {
+        if let Some(found) = find_game_in(&root, platform::search_depth()) {
             return Ok(found.display().to_string());
         }
     }
-    Err("The game was not found on any drive. Choose its folder with Browse.".into())
+    Err(platform::not_found().into())
 }
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Mandyhub")
+            // The window class on Linux (task bar, window rules).
+            .with_app_id("mandyhub")
             .with_inner_size([1280.0, 780.0])
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
@@ -305,11 +368,11 @@ fn workspace() -> PathBuf {
     INSTALL_DIR.lock().unwrap().clone().unwrap_or_else(default_workspace)
 }
 
-/// `%LOCALAPPDATA%\Mandyhub`: where projects go unless the player chose
-/// another folder (Settings: Install folder).
+/// The launcher's own folder (`%LOCALAPPDATA%\Mandyhub` on Windows,
+/// `~/.local/share/mandyhub` on Linux): where projects go unless the player
+/// chose another folder (Settings: Install folder).
 fn default_workspace() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    base.join("Mandyhub")
+    platform::app_dir()
 }
 
 /// The install folder the player chose, if any.
@@ -360,6 +423,7 @@ fn copy_dir(from: &Path, to: &Path, log: &dyn Fn(String)) -> std::io::Result<()>
 
 /// The launcher's folders had another name before: they are moved once, so
 /// installed projects, settings and pictures stay.
+#[cfg(windows)]
 fn migrate_old_folders() {
     for var in ["LOCALAPPDATA", "APPDATA"] {
         let Some(base) = std::env::var_os(var).map(PathBuf::from) else { continue };
@@ -369,6 +433,10 @@ fn migrate_old_folders() {
         }
     }
 }
+
+/// Nothing to move: the folders had no other name before.
+#[cfg(not(windows))]
+fn migrate_old_folders() {}
 
 /// Words kept out of the source as text: the game's name in the ways other
 /// sites write it, to replace or skip (`clean_text`, `names_the_game`), and
@@ -1175,14 +1243,25 @@ impl App {
             return;
         }
         let running = self.job.lock().unwrap().running;
+        // Windows: winget installs them. Linux: the package manager asks for
+        // a password, so the command to run is shown, ready to copy.
+        let command = if platform::can_auto_install() { None } else { tools::install_command(&t) };
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("To install projects you need:").color(look::GOLD).strong());
             for m in t.missing() {
                 chip(ui, m, BAD);
             }
-            let b = egui::Button::new(RichText::new("Install missing tools for me").color(Color32::WHITE)).fill(look::CORAL);
-            if ui.add_enabled(!running, b).clicked() {
-                self.start_tools(ctx);
+            if platform::can_auto_install() {
+                let b = egui::Button::new(RichText::new("Install missing tools for me").color(Color32::WHITE)).fill(look::CORAL);
+                if ui.add_enabled(!running, b).clicked() {
+                    self.start_tools(ctx);
+                }
+            }
+            if let Some(cmd) = &command {
+                let b = egui::Button::new(RichText::new("Copy the command").color(Color32::WHITE)).fill(look::CORAL);
+                if ui.add(b).clicked() {
+                    ui.output_mut(|o| o.copied_text = cmd.clone());
+                }
             }
             if ui.add_enabled(!running, egui::Button::new("Check again")).clicked() {
                 self.tools = None;
@@ -1193,11 +1272,18 @@ impl App {
                 });
             }
         });
+        if let Some(cmd) = command {
+            ui.label(RichText::new(cmd).monospace().size(12.5).color(look::SKY));
+        }
         ui.add_space(4.0);
     }
 
     /// Installs what is missing with winget, then looks again.
     fn start_tools(&mut self, ctx: &egui::Context) {
+        // Only Windows installs the tools itself (winget).
+        if !platform::can_auto_install() {
+            return;
+        }
         let job = self.job.clone();
         {
             let mut j = job.lock().unwrap();
@@ -1612,7 +1698,11 @@ impl App {
             ui.checkbox(&mut self.saved.bright_shadows, "Brighter shadows (beta)");
         });
         ui.add_space(10.0);
-        ui.checkbox(&mut self.saved.fullscreen, RichText::new("Fullscreen").strong());
+        if cfg!(windows) {
+            ui.checkbox(&mut self.saved.fullscreen, RichText::new("Fullscreen").strong());
+        } else {
+            ui.label(RichText::new("Fullscreen is set by the window manager on Linux; the project opens its own window.").color(DIM).size(13.0));
+        }
         ui.add_space(10.0);
         let running = self.job.lock().unwrap().running;
         ui.horizontal(|ui| {
@@ -1707,5 +1797,104 @@ impl App {
             };
             ui.label(RichText::new(why).color(DIM));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shell(text: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        parse_shell(text, &mut out);
+        out
+    }
+
+    #[test]
+    fn shell_assignments_are_read() {
+        let out = shell("export VICTORY_A=1 VICTORY_B=\"two words\"\nVICTORY_C='three'");
+        assert!(out.contains(&("VICTORY_A".to_string(), "1".to_string())), "{out:?}");
+        assert!(out.contains(&("VICTORY_B".to_string(), "two words".to_string())), "{out:?}");
+        assert!(out.contains(&("VICTORY_C".to_string(), "three".to_string())), "{out:?}");
+    }
+
+    #[test]
+    fn shell_comments_and_mentions_are_not_settings() {
+        let out = shell("# VICTORY_NO=1\nif [ -n \"$VICTORY_X\" ]; then VICTORY_YES=2; fi");
+        assert_eq!(out, vec![("VICTORY_YES".to_string(), "2".to_string())], "{out:?}");
+    }
+
+    #[test]
+    fn shell_expansions_are_left_out() {
+        let out = shell("VICTORY_F=$HOME/here\nVICTORY_G=${OTHER}");
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn powershell_assignments_are_read() {
+        let mut out = Vec::new();
+        parse_powershell("$settings.VICTORY_FOO = '1'; VICTORY_BAR = \"2\"", &mut out);
+        assert_eq!(
+            out,
+            vec![("VICTORY_FOO".to_string(), "1".to_string()), ("VICTORY_BAR".to_string(), "2".to_string())],
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_setting_set_twice_keeps_the_last_value() {
+        let dir = std::env::temp_dir().join("mandyhub-test-launch-env");
+        let scripts = dir.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(scripts.join("play.sh"), "VICTORY_FOO=1\nVICTORY_FOO=2\n").unwrap();
+        let vars = detect_launch_env(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(vars, vec![("VICTORY_FOO".to_string(), "2".to_string())], "{vars:?}");
+    }
+
+    #[test]
+    fn the_built_binary_has_this_system_suffix() {
+        let exe = built_exe("owner/name");
+        assert_eq!(exe.file_name().unwrap().to_string_lossy(), format!("victory{}", std::env::consts::EXE_SUFFIX));
+    }
+
+    #[test]
+    fn the_launcher_folder_is_the_users_data_folder() {
+        let dir = default_workspace();
+        // A real folder of the user's, not the working directory.
+        assert!(dir.is_absolute(), "{dir:?}");
+        #[cfg(not(windows))]
+        {
+            // $XDG_DATA_HOME/mandyhub, else ~/.local/share/mandyhub.
+            let base = std::env::var_os("XDG_DATA_HOME")
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local").join("share"));
+            assert_eq!(dir, base.join("mandyhub"));
+        }
+    }
+
+    #[test]
+    fn the_game_is_found_folders_down_but_not_too_deep() {
+        let root = std::env::temp_dir().join("mandyhub-test-search");
+        let deep = root.join("Games").join("VI").join("copy").join("x");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join(EXE_NAME), b"").unwrap();
+        // Past the search depth: never reached.
+        let deep_past = root.join("a").join("b").join("c").join("d").join("e");
+        std::fs::create_dir_all(&deep_past).unwrap();
+        std::fs::write(deep_past.join(EXE_NAME), b"").unwrap();
+        let found = find_game_in(&root, 4);
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(found, Some(deep), "{found:?}");
+    }
+
+    #[test]
+    fn a_github_link_gives_owner_and_name() {
+        assert_eq!(parse_repo("https://github.com/Owner/Name.git").as_deref(), Some("Owner/Name"));
+        assert_eq!(parse_repo("github.com/Owner/Name/").as_deref(), Some("Owner/Name"));
+        assert_eq!(parse_repo("Owner/Name").as_deref(), Some("Owner/Name"));
+        assert!(parse_repo("https://example.com/Owner/Name").is_none());
+        assert!(parse_repo("not a repo").is_none());
     }
 }
