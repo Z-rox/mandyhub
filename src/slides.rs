@@ -12,8 +12,49 @@ const HOLD: f32 = 9.0;
 const FADE: f32 = 2.0;
 
 pub fn folder() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     base.join("Mandyhub").join("backgrounds")
+}
+
+/// The pictures in [`folder`] (jpg, jpeg, png), sorted by name.
+pub fn list() -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(folder())
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    files.retain(|f| {
+        let e = f
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        e == "jpg" || e == "jpeg" || e == "png"
+    });
+    files.sort();
+    files
+}
+
+/// Copies `from` into [`folder`] under a name not taken yet; the copy's path.
+pub fn add(from: &std::path::Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(folder())?;
+    let stem = from
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("picture");
+    let ext = from
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg")
+        .to_lowercase();
+    let mut to = folder().join(format!("{stem}.{ext}"));
+    let mut n = 2;
+    while to.exists() {
+        to = folder().join(format!("{stem} ({n}).{ext}"));
+        n += 1;
+    }
+    std::fs::copy(from, &to)?;
+    Ok(to)
 }
 
 pub struct Slides {
@@ -28,24 +69,28 @@ impl Slides {
         let out = decoded.clone();
         std::thread::spawn(move || {
             let _ = std::fs::create_dir_all(folder());
-            let mut files: Vec<PathBuf> = std::fs::read_dir(folder())
-                .map(|d| d.flatten().map(|e| e.path()).collect())
-                .unwrap_or_default();
-            files.retain(|f| {
-                let e = f.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                e == "jpg" || e == "jpeg" || e == "png"
-            });
-            files.sort();
-            for f in files.into_iter().take(24) {
+            for f in list().into_iter().take(24) {
                 let Ok(img) = image::open(&f) else { continue };
                 // At most 1920 wide: enough for the window, light on memory.
-                let img = if img.width() > 1920 { img.resize(1920, 1920, image::imageops::FilterType::Triangle) } else { img };
+                let img = if img.width() > 1920 {
+                    img.resize(1920, 1920, image::imageops::FilterType::Triangle)
+                } else {
+                    img
+                };
                 let rgba = img.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
-                out.lock().unwrap().push(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()));
+                out.lock()
+                    .unwrap()
+                    .push(egui::ColorImage::from_rgba_unmultiplied(
+                        size,
+                        rgba.as_raw(),
+                    ));
             }
         });
-        Slides { decoded, textures: Vec::new() }
+        Slides {
+            decoded,
+            textures: Vec::new(),
+        }
     }
 
     /// Paints the pictures over the whole window at time `t`; false if there
@@ -53,7 +98,8 @@ impl Slides {
     pub fn paint(&mut self, ctx: &egui::Context, t: f32) -> bool {
         for (i, img) in self.decoded.lock().unwrap().drain(..).enumerate() {
             let name = format!("slide-{}-{i}", self.textures.len());
-            self.textures.push(ctx.load_texture(name, img, egui::TextureOptions::LINEAR));
+            self.textures
+                .push(ctx.load_texture(name, img, egui::TextureOptions::LINEAR));
         }
         if self.textures.is_empty() {
             return false;
@@ -71,7 +117,11 @@ impl Slides {
             let [w, h] = tex.size();
             let (img_aspect, scr_aspect) = (w as f32 / h as f32, screen.width() / screen.height());
             // Cover the window: crop the picture to the window's shape.
-            let (mut uw, mut uh) = if img_aspect > scr_aspect { (scr_aspect / img_aspect, 1.0) } else { (1.0, img_aspect / scr_aspect) };
+            let (mut uw, mut uh) = if img_aspect > scr_aspect {
+                (scr_aspect / img_aspect, 1.0)
+            } else {
+                (1.0, img_aspect / scr_aspect)
+            };
             // Slowly closer: 100% to 88% of the picture over its time.
             let p = (since / (HOLD + FADE)).clamp(0.0, 1.0);
             let zoom = 1.0 - 0.12 * p;
@@ -84,7 +134,10 @@ impl Slides {
                 2 => (0.6, -1.0),
                 _ => (-0.5, -0.8),
             };
-            let (cx, cy) = (0.5 + dir.0 * (1.0 - uw) * 0.5 * (p - 0.5), 0.5 + dir.1 * (1.0 - uh) * 0.5 * (p - 0.5));
+            let (cx, cy) = (
+                0.5 + dir.0 * (1.0 - uw) * 0.5 * (p - 0.5),
+                0.5 + dir.1 * (1.0 - uh) * 0.5 * (p - 0.5),
+            );
             let uv = Rect::from_center_size(Pos2::new(cx, cy), egui::vec2(uw, uh));
             let tint = Color32::from_white_alpha((alpha.clamp(0.0, 1.0) * 255.0) as u8);
             painter.image(tex.id(), screen, uv, tint);

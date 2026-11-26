@@ -15,7 +15,12 @@ pub fn time(ctx: &egui::Context) -> f32 {
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
-    Color32::from_rgba_unmultiplied(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()), l(a.a(), b.a()))
+    Color32::from_rgba_unmultiplied(
+        l(a.r(), b.r()),
+        l(a.g(), b.g()),
+        l(a.b(), b.b()),
+        l(a.a(), b.a()),
+    )
 }
 
 fn alpha(c: Color32, a: f32) -> Color32 {
@@ -84,7 +89,10 @@ pub fn background(ctx: &egui::Context, animate: bool) {
     gradient(
         &painter,
         Rect::from_min_max(Pos2::new(rect.left(), horizon), rect.max),
-        &[(0.0, Color32::from_rgb(30, 6, 50)), (1.0, Color32::from_rgb(4, 2, 12))],
+        &[
+            (0.0, Color32::from_rgb(30, 6, 50)),
+            (1.0, Color32::from_rgb(4, 2, 12)),
+        ],
     );
 
     // Stars, twinkling.
@@ -121,8 +129,19 @@ pub fn background(ctx: &egui::Context, animate: bool) {
         }
         let dy = (center.y - (y0 + y1) * 0.5).abs();
         let half = (r * r - dy * dy).max(0.0).sqrt();
-        let c = mix(Color32::from_rgb(255, 220, 90), PINK, (row as f32 / rows as f32) * 1.6);
-        painter.rect_filled(Rect::from_min_max(Pos2::new(center.x - half, y0), Pos2::new(center.x + half, y1)), 0.0, c);
+        let c = mix(
+            Color32::from_rgb(255, 220, 90),
+            PINK,
+            (row as f32 / rows as f32) * 1.6,
+        );
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(center.x - half, y0),
+                Pos2::new(center.x + half, y1),
+            ),
+            0.0,
+            c,
+        );
     }
 
     // The grid: lines toward a vanishing point, and rows running at you.
@@ -130,21 +149,36 @@ pub fn background(ctx: &egui::Context, animate: bool) {
     let grid = alpha(PINK, 0.55);
     for i in -18..=18 {
         let x = rect.center().x + i as f32 * rect.width() / 9.0;
-        painter.line_segment([vp, Pos2::new(x, rect.bottom())], Stroke::new(1.2_f32, grid));
+        painter.line_segment(
+            [vp, Pos2::new(x, rect.bottom())],
+            Stroke::new(1.2_f32, grid),
+        );
     }
     let speed = (t * 0.35).fract();
     for i in 0..14 {
         let z = (i as f32 + speed) / 14.0;
         let y = horizon + (rect.bottom() - horizon) * z * z;
         let a = 0.15 + z * 0.65;
-        painter.line_segment([Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)], Stroke::new(1.0 + z, alpha(PINK, a)));
+        painter.line_segment(
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            Stroke::new(1.0 + z, alpha(PINK, a)),
+        );
     }
-    painter.line_segment([Pos2::new(rect.left(), horizon), Pos2::new(rect.right(), horizon)], Stroke::new(2.0_f32, alpha(ORANGE, 0.9)));
+    painter.line_segment(
+        [
+            Pos2::new(rect.left(), horizon),
+            Pos2::new(rect.right(), horizon),
+        ],
+        Stroke::new(2.0_f32, alpha(ORANGE, 0.9)),
+    );
 
     // Scanlines over everything.
     let mut y = rect.top();
     while y < rect.bottom() {
-        painter.line_segment([Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)], Stroke::new(1.0_f32, Color32::from_black_alpha(28)));
+        painter.line_segment(
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            Stroke::new(1.0_f32, Color32::from_black_alpha(28)),
+        );
         y += 3.0;
     }
 
@@ -158,10 +192,14 @@ pub fn background(ctx: &egui::Context, animate: bool) {
 pub fn text_sizes(ctx: &egui::Context) {
     use egui::{FontId, TextStyle};
     let mut s = (*ctx.style()).clone();
-    s.text_styles.insert(TextStyle::Body, FontId::proportional(15.5));
-    s.text_styles.insert(TextStyle::Button, FontId::proportional(15.5));
-    s.text_styles.insert(TextStyle::Small, FontId::proportional(12.5));
-    s.text_styles.insert(TextStyle::Heading, FontId::proportional(24.0));
+    s.text_styles
+        .insert(TextStyle::Body, FontId::proportional(15.5));
+    s.text_styles
+        .insert(TextStyle::Button, FontId::proportional(15.5));
+    s.text_styles
+        .insert(TextStyle::Small, FontId::proportional(12.5));
+    s.text_styles
+        .insert(TextStyle::Heading, FontId::proportional(24.0));
     ctx.set_style(s);
 }
 
@@ -171,8 +209,19 @@ pub fn glow_text(ui: &mut egui::Ui, text: &str, size: f32, color: Color32) -> eg
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
     let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::hover());
     let painter = ui.painter();
-    for (dx, dy, a) in [(-2.0, 0.0, 0.25), (2.0, 0.0, 0.25), (0.0, -2.0, 0.25), (0.0, 2.0, 0.25), (-4.0, 0.0, 0.1), (4.0, 0.0, 0.1)] {
-        let g = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(size), alpha(color, a));
+    for (dx, dy, a) in [
+        (-2.0, 0.0, 0.25),
+        (2.0, 0.0, 0.25),
+        (0.0, -2.0, 0.25),
+        (0.0, 2.0, 0.25),
+        (-4.0, 0.0, 0.1),
+        (4.0, 0.0, 0.1),
+    ] {
+        let g = ui.painter().layout_no_wrap(
+            text.to_string(),
+            egui::FontId::proportional(size),
+            alpha(color, a),
+        );
         painter.galley(rect.min + Vec2::new(dx, dy), g, alpha(color, a));
     }
     painter.galley(rect.min, galley, color);
@@ -183,22 +232,44 @@ pub fn glow_text(ui: &mut egui::Ui, text: &str, size: f32, color: Color32) -> eg
 pub fn glass() -> egui::Frame {
     egui::Frame::none()
         .fill(Color32::from_rgba_unmultiplied(10, 6, 24, 200))
-        .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 46, 150, 90)))
+        .stroke(Stroke::new(
+            1.0_f32,
+            Color32::from_rgba_unmultiplied(255, 46, 150, 90),
+        ))
         .inner_margin(14.0)
 }
 
 /// A clickable card that lights up, slides and grows a neon bar on hover;
 /// a selected one has a pulsing border. Returns the click response.
-pub fn card(ui: &mut egui::Ui, id: egui::Id, selected: bool, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+pub fn card(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    selected: bool,
+    add: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
     let t = time(ui.ctx());
     let hover_id = id.with("hover");
-    let hovered_before = ui.ctx().data(|d| d.get_temp::<bool>(hover_id)).unwrap_or(false);
-    let h = ui.ctx().animate_bool_with_time(hover_id.with("anim"), hovered_before || selected, 0.18);
+    let hovered_before = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(hover_id))
+        .unwrap_or(false);
+    let h =
+        ui.ctx()
+            .animate_bool_with_time(hover_id.with("anim"), hovered_before || selected, 0.18);
     let slide = 6.0 * h;
     let width = ui.available_width();
     let inner = egui::Frame::none()
-        .fill(mix(Color32::from_rgba_unmultiplied(20, 12, 44, 215), Color32::from_rgba_unmultiplied(70, 20, 90, 230), h))
-        .inner_margin(egui::Margin { left: 16.0 + slide, right: 12.0, top: 10.0, bottom: 10.0 })
+        .fill(mix(
+            Color32::from_rgba_unmultiplied(20, 12, 44, 215),
+            Color32::from_rgba_unmultiplied(70, 20, 90, 230),
+            h,
+        ))
+        .inner_margin(egui::Margin {
+            left: 16.0 + slide,
+            right: 12.0,
+            top: 10.0,
+            bottom: 10.0,
+        })
         .show(ui, |ui| {
             ui.set_width(width - 28.0 - slide);
             add(ui);
@@ -207,15 +278,28 @@ pub fn card(ui: &mut egui::Ui, id: egui::Id, selected: bool, add: impl FnOnce(&m
     let painter = ui.painter();
     // The neon bar on the left grows with the hover.
     let bar = Rect::from_min_size(rect.min, Vec2::new(3.0 + 5.0 * h, rect.height()));
-    painter.rect_filled(bar, 0.0, if selected { shimmer(t, 0.0) } else { mix(PURPLE, PINK, h) });
+    painter.rect_filled(
+        bar,
+        0.0,
+        if selected {
+            shimmer(t, 0.0)
+        } else {
+            mix(PURPLE, PINK, h)
+        },
+    );
     if selected {
         let pulse = (t * 3.0).sin() * 0.5 + 0.5;
-        painter.rect_stroke(rect, 0.0, Stroke::new(1.5 + pulse, alpha(PINK, 0.6 + 0.4 * pulse)));
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(1.5 + pulse, alpha(PINK, 0.6 + 0.4 * pulse)),
+        );
     } else if h > 0.01 {
         painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, alpha(PINK, 0.5 * h)));
     }
     let resp = ui.interact(rect, id, Sense::click());
-    ui.ctx().data_mut(|d| d.insert_temp(hover_id, resp.hovered()));
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(hover_id, resp.hovered()));
     resp
 }
 
@@ -224,8 +308,17 @@ pub fn card(ui: &mut egui::Ui, id: egui::Id, selected: bool, add: impl FnOnce(&m
 pub fn big_button(ui: &mut egui::Ui, label: &str, enabled: bool, busy: bool) -> egui::Response {
     let t = time(ui.ctx());
     let size = Vec2::new(260.0, 56.0);
-    let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
-    let h = ui.ctx().animate_bool_with_time(resp.id.with("h"), enabled && resp.hovered(), 0.15);
+    let (rect, resp) = ui.allocate_exact_size(
+        size,
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let h = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("h"), enabled && resp.hovered(), 0.15);
     let painter = ui.painter();
     if enabled {
         let pulse = (t * 2.4).sin() * 0.5 + 0.5;
@@ -252,8 +345,16 @@ pub fn big_button(ui: &mut egui::Ui, label: &str, enabled: bool, busy: bool) -> 
             Pos2::new(x - 20.0, rect.bottom()),
         ];
         let clip = painter.clip_rect().intersect(rect);
-        painter.with_clip_rect(clip).add(Shape::convex_polygon(band, alpha(Color32::WHITE, 0.22), Stroke::NONE));
-        painter.rect_stroke(rect, 0.0, Stroke::new(2.0_f32, alpha(Color32::WHITE, 0.5 + 0.5 * h)));
+        painter.with_clip_rect(clip).add(Shape::convex_polygon(
+            band,
+            alpha(Color32::WHITE, 0.22),
+            Stroke::NONE,
+        ));
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(2.0_f32, alpha(Color32::WHITE, 0.5 + 0.5 * h)),
+        );
     } else {
         painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(40, 30, 60, 220));
         painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, alpha(Color32::WHITE, 0.15)));
@@ -265,11 +366,23 @@ pub fn big_button(ui: &mut egui::Ui, label: &str, enabled: bool, busy: bool) -> 
         label.to_string()
     };
     painter.text(
-        rect.center() + Vec2::new(0.0, if resp.is_pointer_button_down_on() { 1.0 } else { 0.0 }),
+        rect.center()
+            + Vec2::new(
+                0.0,
+                if resp.is_pointer_button_down_on() {
+                    1.0
+                } else {
+                    0.0
+                },
+            ),
         egui::Align2::CENTER_CENTER,
         text,
         egui::FontId::proportional(24.0),
-        if enabled { Color32::WHITE } else { alpha(Color32::WHITE, 0.35) },
+        if enabled {
+            Color32::WHITE
+        } else {
+            alpha(Color32::WHITE, 0.35)
+        },
     );
     resp
 }
