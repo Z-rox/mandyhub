@@ -12,8 +12,7 @@ const HOLD: f32 = 9.0;
 const FADE: f32 = 2.0;
 
 pub fn folder() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    base.join("Mandyhub").join("backgrounds")
+    crate::platform::app_dir().join("backgrounds")
 }
 
 pub struct Slides {
