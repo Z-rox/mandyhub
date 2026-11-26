@@ -28,7 +28,11 @@ The launcher is `target\release\mandyhub.exe`.
 
 ## Backgrounds
 
-Put your own `.jpg` or `.png` pictures in `%LOCALAPPDATA%\Mandyhub\backgrounds`. They slowly move and fade into each other behind the launcher. Without pictures, an animated scene is shown.
+Put your own `.jpg` or `.png` pictures in `%LOCALAPPDATA%\Mandyhub\backgrounds`. They slowly move and fade into each other in a banner across the top of each project's page. Without pictures, the page has no banner.
+
+## Fonts
+
+The display type is Josefin Sans and Big Shoulders Display, built into the exe from `fonts/` under the SIL Open Font License (license texts in `fonts/`). Reading text and icons use Windows' own Segoe UI and Segoe Fluent Icons.
 
 ## Credits
 

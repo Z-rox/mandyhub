@@ -9,14 +9,13 @@
 //! No game files are included or downloaded: the player supplies their own.
 #![windows_subsystem = "windows"]
 
-#[allow(dead_code)]
-mod design;
-mod slides;
-mod look;
 mod fullscreen;
+mod slides;
+mod theme;
 mod tools;
+mod ui;
 
-use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
+use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -36,17 +35,6 @@ const REQUIRED: &[&str] = &[
     "shaders.rpf",
     "textures.rpf",
 ];
-
-// Colours: a dark night with a sunset accent.
-const CARD: Color32 = Color32::from_rgb(34, 28, 56);
-const CARD_SEL: Color32 = Color32::from_rgb(70, 36, 86);
-const PINK: Color32 = Color32::from_rgb(255, 72, 160);
-const ORANGE: Color32 = Color32::from_rgb(255, 150, 60);
-const TEAL: Color32 = Color32::from_rgb(60, 220, 210);
-const TEXT: Color32 = Color32::from_rgb(235, 230, 245);
-const DIM: Color32 = Color32::from_rgb(150, 140, 175);
-const GOOD: Color32 = Color32::from_rgb(90, 220, 120);
-const BAD: Color32 = Color32::from_rgb(255, 90, 90);
 
 /// A project the player can pick.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,6 +77,12 @@ struct Saved {
     render_scale: f32,
     extra_env: String,
     gpu_filter: usize,
+    /// Translate the shaders into the cache (`victory translate --cache`) before each Play.
+    warm_before_play: bool,
+    /// With the warm-up, also build the GPU pipelines (`--pipelines`; can take hours).
+    warm_pipelines: bool,
+    /// Extra arguments for `victory run`; the game's own go after `--`.
+    launch_args: String,
 }
 
 /// Shared state of the background job (download, build, play).
@@ -100,18 +94,78 @@ struct Job {
     stage: String,
     log: Vec<String>,
     failed: bool,
+    /// The process running now, while the player may stop it (a warm-up).
+    pid: Option<u32>,
+    stoppable: bool,
+    /// The player pressed Stop.
+    stopped: bool,
+}
+
+/// How a project is started, read from the settings when its job starts.
+/// The warm-up and Play share it, so the warm-up fills the cache Play reads.
+#[derive(Clone)]
+struct Launch {
+    game_dir: PathBuf,
+    series_s: bool,
+    scale: f32,
+    /// `VICTORY_*` lines: the player's switches and the graphics fixes.
+    extra: String,
+    fullscreen: bool,
+    warm_first: bool,
+    pipelines: bool,
+    args: Vec<String>,
+}
+
+/// The game files `victory translate --cache` reads shaders from (those that exist are passed).
+const WARM_FILES: &[&str] = &["shaders.rpf", EXE_NAME, "XboxBvhBuilder.dll", "amd_fidelityfx_upscaler_xbox.dll"];
+
+/// Launch arguments as the player typed them: split at spaces, "double quotes" keeping one together.
+fn split_args(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    for ch in s.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    out.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        out.push(cur);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_args;
+
+    #[test]
+    fn launch_arguments_split_at_spaces_and_keep_quotes_together() {
+        assert_eq!(split_args(""), Vec::<String>::new());
+        assert_eq!(split_args("  --strict   "), ["--strict"]);
+        assert_eq!(split_args("--strict -- -windowed"), ["--strict", "--", "-windowed"]);
+        assert_eq!(split_args(r#"-- -name "two words" """#), ["--", "-name", "two words", ""]);
+    }
 }
 
 struct App {
     saved: Saved,
     projects: Arc<Mutex<Option<Result<Vec<Project>, String>>>>,
     job: Arc<Mutex<Job>>,
-    custom_link: String,
-    custom_error: Option<String>,
     files: Vec<(&'static str, bool)>,
     files_for: String,
     tools: Option<tools::Tools>,
-    confirm_custom: Option<String>,
     /// The project an uninstall is being confirmed for.
     confirm_uninstall: Option<String>,
     /// A new install folder waiting for "move the projects there?" (from, to).
@@ -122,14 +176,45 @@ struct App {
     finding: Arc<Mutex<Option<Option<Result<String, String>>>>>,
     /// What is known about each project's install, by repo.
     repos: Arc<Mutex<std::collections::HashMap<String, RepoState>>>,
-    show_settings: bool,
     show_log: bool,
-    /// The moving pictures behind everything.
+    /// The player's own pictures, across the top of a project's page.
     slides: slides::Slides,
     /// When every installed project was last checked for updates (seconds).
     last_auto_check: f64,
-    /// The project the update notification is about, while it shows.
-    notice: Option<String>,
+    /// Which page shows: the projects or the settings.
+    view: View,
+    /// What the project list is narrowed to.
+    search: String,
+    /// The "Add a repo by link" dialog, while it is open.
+    add_repo: Option<AddRepo>,
+    /// Why the last drive search found no game.
+    find_error: Option<String>,
+    /// The project whose page shows, and when it came in (for its entrance).
+    shown: Option<String>,
+    shown_at: f64,
+    /// When the repo link was last copied: its button shows a tick for a moment.
+    copied_at: f64,
+    /// When the open dialog opened (for its entrance), and whether one was open last frame.
+    modal_at: f64,
+    modal_was_open: bool,
+    /// Whether the window's title bar was made dark.
+    title_bar_done: bool,
+    /// Whether the window's remembered size was checked at start.
+    size_checked: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Projects,
+    Settings,
+}
+
+/// The "Add a repo by link" dialog.
+struct AddRepo {
+    link: String,
+    error: Option<String>,
+    /// Put the cursor in the field on the first frame.
+    focus: bool,
 }
 
 /// How often installed projects are checked for updates: every 15 minutes.
@@ -153,6 +238,8 @@ enum Kind {
     Install,
     Play,
     Uninstall,
+    /// Shaders into the cache ahead of time, without playing.
+    Warm,
 }
 
 fn slug(repo: &str) -> String {
@@ -292,8 +379,9 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Mandyhub")
-            .with_inner_size([1280.0, 780.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([960.0, 620.0])
+            .with_icon(theme::app_icon()),
         ..Default::default()
     };
     migrate_old_folders();
@@ -465,7 +553,8 @@ pub(crate) fn hide_window(_: &mut Command) {}
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> App {
-        style(&cc.egui_ctx);
+        theme::install(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx);
         let mut saved: Saved = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
         if saved.render_scale <= 0.0 {
             saved.render_scale = 0.5;
@@ -474,22 +563,28 @@ impl App {
             saved,
             projects: Arc::new(Mutex::new(None)),
             job: Arc::new(Mutex::new(Job::default())),
-            custom_link: String::new(),
-            custom_error: None,
             files: Vec::new(),
             files_for: String::new(),
             tools: None,
-            confirm_custom: None,
             confirm_uninstall: None,
             pending_move: None,
             empty: false,
             finding: Arc::new(Mutex::new(None)),
             repos: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            show_settings: false,
             show_log: false,
             slides: slides::Slides::new(),
             last_auto_check: -1.0,
-            notice: None,
+            view: View::Projects,
+            search: String::new(),
+            add_repo: None,
+            find_error: None,
+            shown: None,
+            shown_at: 0.0,
+            copied_at: -10.0,
+            modal_at: 0.0,
+            modal_was_open: false,
+            title_bar_done: false,
+            size_checked: false,
         };
         if !app.saved.defaults_set {
             app.saved.defaults_set = true;
@@ -615,10 +710,6 @@ impl App {
         }
         // An install over an installed project is an update.
         let updating = kind == Kind::Install && built_exe(&p.repo).is_file();
-        let game_dir = PathBuf::from(&self.saved.game_dir);
-        let series_s = self.saved.series_s;
-        let fullscreen = self.saved.fullscreen;
-        let scale = self.saved.render_scale;
         let mut extra = self.saved.extra_env.clone();
         if self.saved.fix_8gb {
             extra.push_str("\nVICTORY_TEXTURE_DROP_MIPS=2\nVICTORY_NULL_COLOR=grey");
@@ -626,23 +717,38 @@ impl App {
         if self.saved.bright_shadows {
             extra.push_str("\nVICTORY_AMBIENT=0.6");
         }
+        let launch = Launch {
+            game_dir: PathBuf::from(&self.saved.game_dir),
+            series_s: self.saved.series_s,
+            scale: self.saved.render_scale,
+            extra,
+            fullscreen: self.saved.fullscreen,
+            warm_first: self.saved.warm_before_play,
+            pipelines: self.saved.warm_pipelines,
+            args: split_args(&self.saved.launch_args),
+        };
         let (ctx, repos) = (ctx.clone(), self.repos.clone());
         std::thread::spawn(move || {
             let r = match kind {
                 Kind::Install => install(&job, &ctx, &p),
-                Kind::Play => play(&job, &ctx, &p, &game_dir, series_s, scale, &extra, fullscreen),
+                Kind::Play => play(&job, &ctx, &p, &launch),
                 Kind::Uninstall => uninstall(&job, &ctx, &p),
+                Kind::Warm => warm(&job, &ctx, &p, &launch),
             };
             {
                 let mut j = job.lock().unwrap();
                 j.running = false;
+                j.pid = None;
+                j.stoppable = false;
                 match r {
+                    _ if j.stopped => j.stage = "Stopped".into(),
                     Ok(()) => {
                         j.stage = match kind {
                             Kind::Install if updating => "Updated: ready to play".into(),
                             Kind::Install => "Installed: ready to play".into(),
                             Kind::Play => "Game closed".into(),
                             Kind::Uninstall => "Uninstalled".into(),
+                            Kind::Warm => "Shaders warmed up: ready to play".into(),
                         }
                     }
                     Err(e) => {
@@ -650,13 +756,14 @@ impl App {
                         j.stage = match kind {
                             Kind::Install if updating => "Update failed: the old version is still installed (see the log)".into(),
                             Kind::Install => "Install failed (see the log)".into(),
+                            Kind::Warm => "Warm-up failed (see the log)".into(),
                             _ => "Failed".into(),
                         };
                         j.log.push(format!("ERROR: {e}"));
                     }
                 }
             }
-            if kind != Kind::Play {
+            if matches!(kind, Kind::Install | Kind::Uninstall) {
                 let st = repo_state(&p);
                 repos.lock().unwrap().insert(p.repo.clone(), st);
             }
@@ -736,41 +843,33 @@ fn uninstall(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project) -> Result<
     Ok(())
 }
 
-/// Starts the installed build of `p`.
-fn play(
-    job: &Arc<Mutex<Job>>,
-    ctx: &egui::Context,
-    p: &Project,
-    game_dir: &Path,
-    series_s: bool,
-    scale: f32,
-    extra: &str,
-    fullscreen: bool,
-) -> Result<(), String> {
+/// The victory.exe `p` runs with: its build, or a build already on this PC.
+fn project_exe(p: &Project) -> Result<PathBuf, String> {
     let exe = p.local_exe.as_ref().map(PathBuf::from).unwrap_or_else(|| built_exe(&p.repo));
-    if !exe.is_file() {
-        return Err("this project is not installed yet: press Install".into());
+    if exe.is_file() {
+        Ok(exe)
+    } else {
+        Err("this project is not installed yet: press Install".into())
     }
-    stage(job, ctx, "Playing");
-    let ws = workspace();
-    let mut c = Command::new(&exe);
-    c.arg("run").arg(game_dir.join(EXE_NAME)).arg("--execute");
-    // The project's own env vars (from its scripts/play.ps1) go first;
-    // the player's switches and extra lines can override them.
-    let dir = repo_dir(&p.repo);
-    for (k, v) in detect_launch_env(&dir) {
+}
+
+/// The environment victory.exe runs with, the same for the warm-up and for
+/// Play: the project's own env vars (from its scripts/play.ps1) first, then
+/// the mode, its data and cache folders, and the player's switches.
+fn victory_env(c: &mut Command, p: &Project, l: &Launch) {
+    for (k, v) in detect_launch_env(&repo_dir(&p.repo)) {
         c.env(&k, &v);
     }
-    if series_s {
-        c.args(["--console", "series-s"]);
+    if l.series_s {
         c.env("VICTORY_OWN_UPSCALER", "1");
-        c.env("VICTORY_RENDER_SCALE", format!("{scale:.2}"));
+        c.env("VICTORY_RENDER_SCALE", format!("{:.2}", l.scale));
     }
+    let ws = workspace();
     let data = ws.join("data").join(slug(&p.repo));
     let _ = std::fs::create_dir_all(&data);
     c.env("VICTORY_DATA_DIR", &data);
     c.env("VICTORY_CACHE_DIR", ws.join("cache").join(slug(&p.repo)));
-    for line in extra.lines() {
+    for line in l.extra.lines() {
         if let Some((k, v)) = line.split_once('=') {
             let k = k.trim();
             if k.starts_with("VICTORY_") {
@@ -778,6 +877,97 @@ fn play(
             }
         }
     }
+}
+
+fn victory_help(exe: &Path, subcommand: &str) -> Option<String> {
+    let mut command = Command::new(exe);
+    command.args([subcommand, "--help"]);
+    hide_window(&mut command);
+    let output = command.output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Fills the same shader cache as Play, using the commands the installed fork exposes.
+fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch) -> Result<(), String> {
+    let exe = project_exe(p)?;
+    let files: Vec<PathBuf> = WARM_FILES.iter().map(|f| l.game_dir.join(f)).filter(|f| f.is_file()).collect();
+    if files.is_empty() {
+        return Err("the game files were not found: choose their folder in Settings".into());
+    }
+    let translate = victory_help(&exe, "translate");
+    let supports_flag = |help: &str, flag: &str| help.split_whitespace().any(|word| word == flag);
+    let translate_cache = translate.as_deref().filter(|help| supports_flag(help, "--cache"));
+    let mut commands = Vec::new();
+    let mut shaders = Command::new(&exe);
+    if let Some(help) = translate_cache {
+        shaders.args(["translate", "--cache"]);
+        if l.pipelines && supports_flag(help, "--pipelines") {
+            shaders.arg("--pipelines");
+        }
+    } else if victory_help(&exe, "shaders").is_some() {
+        shaders.arg("shaders");
+    } else {
+        return Err("This build offers neither translate --cache nor shaders for shader warm-up.".into());
+    }
+    shaders.args(&files);
+    commands.push(shaders);
+    if l.pipelines && !translate_cache.is_some_and(|help| supports_flag(help, "--pipelines")) {
+        if victory_help(&exe, "warm").is_some_and(|help| supports_flag(&help, "--used")) {
+            let mut pipelines = Command::new(&exe);
+            pipelines.args(["warm", "--used"]);
+            commands.push(pipelines);
+        } else {
+            job.lock().unwrap().log.push("This build does not expose a supported pipeline warm-up. Warming shaders only.".into());
+        }
+    }
+    stage(
+        job,
+        ctx,
+        if l.pipelines {
+            "Warming up shaders and pipelines (this can take hours)"
+        } else {
+            "Warming up shaders (the first time takes minutes)"
+        },
+    );
+    for mut command in commands {
+        victory_env(&mut command, p, l);
+        job.lock().unwrap().stoppable = true;
+        let result = run_with(job, ctx, &mut command, |pid| job.lock().unwrap().pid = Some(pid));
+        let stopped = {
+            let mut j = job.lock().unwrap();
+            j.stoppable = false;
+            j.pid = None;
+            j.stopped
+        };
+        if stopped {
+            return Err("stopped".into());
+        }
+        result?;
+    }
+    Ok(())
+}
+
+/// Starts the installed build of `p`, warming its shaders first when the player asked for that.
+fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch) -> Result<(), String> {
+    let exe = project_exe(p)?;
+    if l.warm_first {
+        if let Err(e) = warm(job, ctx, p, l) {
+            if job.lock().unwrap().stopped {
+                return Err("stopped".into());
+            }
+            job.lock().unwrap().log.push(format!("Warm-up failed: {e}. Starting the game anyway."));
+        }
+    }
+    stage(job, ctx, "Playing");
+    let mut c = Command::new(&exe);
+    c.arg("run").arg(l.game_dir.join(EXE_NAME)).arg("--execute");
+    if l.series_s {
+        c.args(["--console", "series-s"]);
+    }
+    // The player's own: more `run` flags, and after `--` the game's.
+    c.args(&l.args);
+    victory_env(&mut c, p, l);
+    let fullscreen = l.fullscreen;
     run_with(job, ctx, &mut c, |pid| {
         if fullscreen {
             fullscreen::keep_borderless(pid);
@@ -820,382 +1010,30 @@ fn run_with(job: &Arc<Mutex<Job>>, ctx: &egui::Context, c: &mut Command, spawned
     status.success().then_some(()).ok_or_else(|| format!("{:?} ended with {status}", c.get_program()))
 }
 
-fn style(ctx: &egui::Context) {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = Color32::TRANSPARENT;
-    v.window_fill = Color32::from_rgba_unmultiplied(14, 8, 30, 245);
-    v.window_rounding = Rounding::same(14.0);
-    v.menu_rounding = Rounding::same(10.0);
-    v.window_stroke = Stroke::new(1.5_f32, PINK);
-    v.extreme_bg_color = Color32::from_rgb(10, 8, 18);
-    v.override_text_color = Some(TEXT);
-    v.selection.bg_fill = PINK;
-    v.widgets.inactive.bg_fill = CARD;
-    v.widgets.inactive.weak_bg_fill = CARD;
-    v.widgets.hovered.weak_bg_fill = CARD_SEL;
-    v.widgets.active.weak_bg_fill = PINK;
-    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
-        w.rounding = Rounding::same(8.0);
-    }
-    v.widgets.noninteractive.rounding = Rounding::same(8.0);
-    v.widgets.open.rounding = Rounding::same(8.0);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, PINK);
-    v.widgets.inactive.weak_bg_fill = Color32::from_rgba_unmultiplied(40, 20, 70, 220);
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgba_unmultiplied(90, 30, 110, 235);
-    ctx.set_visuals(v);
-    let mut s = (*ctx.style()).clone();
-    s.spacing.item_spacing = Vec2::new(10.0, 8.0);
-    s.spacing.button_padding = Vec2::new(14.0, 8.0);
-    ctx.set_style(s);
-    design::text_sizes(ctx);
-}
-
-fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
-    look::tag(ui, text, color, false);
-}
-
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // What the last look found (a look runs at start, after "Check
-        // again" and after the tools were installed).
-        self.tools = tools::current();
-        self.check_files();
-        let playing = {
-            let j = self.job.lock().unwrap();
-            j.running && j.stage == "Playing"
-        };
-        // While a game runs the launcher stands still: the card is the game's.
-        // The player's pictures, slowly moving; the neon scene without any.
-        let bt = design::anim_time(ctx, !playing);
-        if self.slides.paint(ctx, bt) {
-            if !playing {
-                ctx.request_repaint_after(std::time::Duration::from_millis(33));
-            }
-        } else {
-            design::background(ctx, !playing);
+        if !self.title_bar_done {
+            self.title_bar_done = fullscreen::dark_title_bar(std::process::id(), theme::BG, theme::WHITE);
         }
-        let t = design::time(ctx);
-
-        // Header.
-        let header = egui::TopBottomPanel::top("header").frame(look::glass().inner_margin(egui::Margin::symmetric(20.0, 12.0))).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let _ = t;
-                look::gradient_title(ui, "MANDYHUB", 44.0, look::ORANGE, look::PINK);
-                ui.add_space(14.0);
-                ui.vertical(|ui| {
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("COMMUNITY LAUNCHER").color(DIM).size(12.0).strong());
-                    ui.label(RichText::new("by Zettrox").color(look::ORANGE).size(13.0).strong());
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let b = egui::Button::new(RichText::new("⚙  SETTINGS").strong().size(15.0)).min_size(Vec2::new(130.0, 36.0));
-                    if ui.add(b).clicked() {
-                        self.show_settings = !self.show_settings;
-                    }
-                });
-            });
-        });
-        let page_top = header.response.rect.bottom();
-
-        // Bottom: game folder, settings, play.
-        egui::TopBottomPanel::bottom("play").frame(look::glass().inner_margin(16.0)).show(ctx, |ui| {
-            self.bottom(ui, ctx);
-        });
-
-        // Left: the list.
-        egui::SidePanel::left("list").exact_width((ctx.screen_rect().width() * 0.5).clamp(420.0, 700.0)).frame(look::glass().inner_margin(12.0)).show(ctx, |ui| {
-            self.list(ui, ctx);
-        });
-
-        // Right: details and log.
-        egui::CentralPanel::default().frame(look::glass().inner_margin(egui::Margin { left: 18.0, right: 18.0, top: 14.0, bottom: 8.0 })).show(ctx, |ui| {
-            self.details(ui);
-        });
-
-        self.auto_check(ctx);
-        self.update_notice(ctx);
-
-        // Settings: a page of its own that slides in from the right over the
-        // main page, and out again with Back.
-        let a = ctx.animate_bool_with_time(egui::Id::new("settings-page"), self.show_settings, 0.38);
-        if a > 0.001 {
-            let eased = 1.0 - (1.0 - a).powi(3);
-            let screen = ctx.screen_rect();
-            let page = egui::Rect::from_min_max(egui::pos2(screen.left(), page_top), screen.max);
-            let id = egui::Id::new("settings-area");
-            // The main page dims as the settings page comes over it.
-            ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("dim")))
-                .rect_filled(page, 0.0, Color32::from_black_alpha((150.0 * eased) as u8));
-            egui::Area::new(id)
-                .order(egui::Order::Foreground)
-                .fixed_pos(page.min)
-                .show(ctx, |ui| {
-                    look::glass()
-                        .fill(Color32::from_rgba_unmultiplied(14, 8, 24, 225))
-                        .inner_margin(egui::Margin::symmetric(40.0, 24.0))
-                        .show(ui, |ui| {
-                            ui.set_min_size(page.size() - Vec2::new(80.0, 48.0));
-                            ui.set_max_width(page.width() - 80.0);
-                            ui.horizontal(|ui| {
-                                if look::filter_pill(ui, "◀  Back", false).clicked() {
-                                    self.show_settings = false;
-                                }
-                                ui.add_space(16.0);
-                                look::gradient_title(ui, "Settings", 40.0, look::ORANGE, look::PINK);
-                            });
-                            ui.add_space(18.0);
-                            self.settings(ui, ctx);
-                        });
-                });
-            let slide = (1.0 - eased) * page.width();
-            ctx.set_transform_layer(
-                egui::LayerId::new(egui::Order::Foreground, id),
-                egui::emath::TSTransform::from_translation(Vec2::new(slide, 0.0)),
-            );
-            if a < 1.0 {
-                ctx.request_repaint();
+        // A size remembered from a minimized window can come back tiny: then the normal size.
+        if !self.size_checked {
+            let (rect, minimized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().minimized));
+            if let Some(r) = rect {
+                if minimized != Some(true) && (r.width() < 960.0 || r.height() < 620.0) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1280.0, 800.0)));
+                }
+                self.size_checked = true;
             }
         }
-
-        if let Some((old, new)) = self.pending_move.clone() {
-            let mut open = true;
-            egui::Window::new(RichText::new("Move installed projects?").strong().size(18.0))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label(RichText::new(format!("New install folder:\n{}", new.display())).color(Color32::WHITE));
-                    ui.label(RichText::new("Your installed projects (and their saves) are in the old folder. Move them to the new one? Moving to another drive can take a while.").color(DIM));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let b = egui::Button::new(RichText::new("Move them").color(Color32::WHITE)).fill(look::CORAL);
-                        if ui.add(b).clicked() {
-                            self.apply_install_dir(&new);
-                            self.start_move(ctx, old.clone(), new.clone());
-                            self.pending_move = None;
-                        }
-                        if ui.button("Don't move").clicked() {
-                            self.apply_install_dir(&new);
-                            self.pending_move = None;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.pending_move = None;
-                        }
-                    });
-                });
-            if !open {
-                self.pending_move = None;
-            }
-        }
-
-        if let Some(repo) = self.confirm_uninstall.clone() {
-            let name = self.all_projects().into_iter().find(|p| p.repo == repo);
-            let mut open = true;
-            egui::Window::new(RichText::new("Uninstall?").strong().size(18.0))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    let label = name.as_ref().map_or(repo.as_str(), |p| p.name.as_str());
-                    ui.label(RichText::new(format!("Remove {label} from this PC?")).color(Color32::WHITE).size(16.0));
-                    ui.label(RichText::new("Its download, its build and its shader cache are deleted. Your saves stay. You can install it again later.").color(DIM));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let b = egui::Button::new(RichText::new("Uninstall").color(Color32::WHITE)).fill(look::RED);
-                        if ui.add(b).clicked() {
-                            if let Some(p) = name.clone() {
-                                self.start(ctx, p, Kind::Uninstall);
-                            }
-                            self.confirm_uninstall = None;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.confirm_uninstall = None;
-                        }
-                    });
-                });
-            if !open {
-                self.confirm_uninstall = None;
-            }
-        }
-
-        if let Some(repo) = self.confirm_custom.clone() {
-            let mut open = true;
-            egui::Window::new("Add a custom repo?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label(format!("github.com/{repo}"));
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("Play downloads this repo, builds it and runs it on your PC.\nOnly add repos from people you trust: fake repos with malware exist.").color(ORANGE));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(RichText::new("Add it").color(TEXT)).clicked() {
-                            let name = repo.split('/').next_back().unwrap_or(&repo).to_string();
-                            self.saved.custom.retain(|p| p.repo != repo);
-                            self.saved.custom.insert(0, Project {
-                                name,
-                                repo: repo.clone(),
-                                branch: None,
-                                gpu: Vec::new(),
-                                fps: None,
-                                render: None,
-                                verified: false,
-                                summary: "Added by link.".into(),
-                                custom: true,
-                                local_exe: None,
-                            });
-                            self.saved.selected = Some(repo.clone());
-                            self.custom_link.clear();
-                            self.confirm_custom = None;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.confirm_custom = None;
-                        }
-                    });
-                });
-            if !open {
-                self.confirm_custom = None;
-            }
-        }
+        self.draw(ctx);
     }
 }
 
 impl App {
-    fn list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Projects").size(26.0).strong().color(Color32::WHITE));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("⟳ Refresh").clicked() {
-                    self.refresh_projects(ctx);
-                }
-            });
-        });
-        ui.horizontal(|ui| {
-            for (i, name) in ["All", "NVIDIA", "AMD"].iter().enumerate() {
-                if look::filter_pill(ui, name, self.saved.gpu_filter == i).clicked() {
-                    self.saved.gpu_filter = i;
-                }
-            }
-            look::filter_pill(ui, "From portwatch-vi.xyz", false);
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let edit = egui::TextEdit::singleline(&mut self.custom_link).hint_text("Custom repo link: github.com/owner/name").desired_width(290.0);
-            ui.add(edit);
-            if ui.button(RichText::new("+ Add").color(TEAL)).clicked() {
-                match parse_repo(&self.custom_link) {
-                    Some(r) => {
-                        self.custom_error = None;
-                        self.confirm_custom = Some(r);
-                    }
-                    None => self.custom_error = Some("That is not a GitHub repo link.".into()),
-                }
-            }
-        });
-        if let Some(e) = &self.custom_error {
-            ui.label(RichText::new(e).color(BAD));
-        }
-        ui.add_space(6.0);
-
-        let state = match &*self.projects.lock().unwrap() {
-            None => Some("Loading the list from PortWatch...".to_string()),
-            Some(Err(e)) => Some(e.clone()),
-            Some(Ok(_)) => None,
-        };
-        if let Some(s) = state {
-            ui.label(RichText::new(s).color(DIM));
-        }
-        let filter = self.saved.gpu_filter;
-        let projects: Vec<Project> = self
-            .all_projects()
-            .into_iter()
-            .filter(|p| match filter {
-                1 => p.custom || p.gpu.iter().any(|g| g.eq_ignore_ascii_case("nvidia")),
-                2 => p.custom || p.gpu.iter().any(|g| g.eq_ignore_ascii_case("amd")),
-                _ => true,
-            })
-            .collect();
-        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-            let mut remove = None;
-            for pair in projects.chunks(2) {
-                ui.columns(2, |cols| {
-                    for (col, p) in cols.iter_mut().zip(pair) {
-                        let selected = self.saved.selected.as_deref() == Some(p.repo.as_str());
-                        let resp = look::card(col, egui::Id::new(("card", &p.repo)), selected, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(&p.name).size(17.0).strong());
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if let Some(f) = p.fps {
-                                        ui.label(RichText::new(format!("{f:.0} fps")).color(ORANGE).strong().size(16.0));
-                                    }
-                                });
-                            });
-                            ui.label(RichText::new(&p.repo).color(DIM).size(12.0));
-                            ui.horizontal_wrapped(|ui| {
-                                for g in &p.gpu {
-                                    chip(ui, g, if g.eq_ignore_ascii_case("nvidia") { look::LIME } else { look::RED });
-                                }
-                                if p.verified {
-                                    chip(ui, "verified", look::TEAL);
-                                }
-                                if p.custom {
-                                    chip(ui, "custom", ORANGE);
-                                    if ui.small_button("remove").clicked() {
-                                        remove = Some(p.repo.clone());
-                                    }
-                                }
-                            });
-                        });
-                        if resp.clicked() {
-                            self.saved.selected = Some(p.repo.clone());
-                        }
-                    }
-                });
-                ui.add_space(8.0);
-            }
-            if let Some(r) = remove {
-                self.saved.custom.retain(|p| p.repo != r);
-            }
-        });
-    }
-
-    /// When Git, Rust or the C++ build tools are missing: what is missing,
-    /// "Install missing tools" (winget) and "Check again".
-    fn tools_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let Some(t) = self.tools.clone() else { return };
-        if t.ready() {
-            return;
-        }
-        let running = self.job.lock().unwrap().running;
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("To install projects you need:").color(look::GOLD).strong());
-            for m in t.missing() {
-                chip(ui, m, BAD);
-            }
-            let b = egui::Button::new(RichText::new("Install missing tools for me").color(Color32::WHITE)).fill(look::CORAL);
-            if ui.add_enabled(!running, b).clicked() {
-                self.start_tools(ctx);
-            }
-            if ui.add_enabled(!running, egui::Button::new("Check again")).clicked() {
-                self.tools = None;
-                let ctx = ctx.clone();
-                std::thread::spawn(move || {
-                    let _ = tools::detect();
-                    ctx.request_repaint();
-                });
-            }
-        });
-        ui.add_space(4.0);
-    }
-
     /// Installs what is missing with winget, then looks again.
     fn start_tools(&mut self, ctx: &egui::Context) {
         let job = self.job.clone();
@@ -1320,392 +1158,5 @@ impl App {
                 self.check_repo(ctx, &p);
             }
         }
-    }
-
-    /// A notification that slides down from the top when an installed project
-    /// has an update, whichever project is selected: Update now or Later.
-    fn update_notice(&mut self, ctx: &egui::Context) {
-        if self.notice.as_ref().is_none_or(|r| {
-            self.all_projects().iter().find(|p| &p.repo == r).is_none_or(|p| self.update_for(p).is_none())
-        }) {
-            self.notice = self.all_projects().into_iter().find(|p| self.update_for(p).is_some()).map(|p| p.repo);
-        }
-        let shown = self.notice.is_some() && !self.job.lock().unwrap().running;
-        let a = ctx.animate_bool_with_time(egui::Id::new("notice-anim"), shown, 0.4);
-        if a < 0.001 {
-            return;
-        }
-        let Some(p) = self.notice.as_ref().and_then(|r| self.all_projects().into_iter().find(|p| &p.repo == r)) else {
-            return;
-        };
-        let eased = 1.0 - (1.0 - a).powi(3);
-        let screen = ctx.screen_rect();
-        let id = egui::Id::new("update-notice");
-        let width = 560.0_f32.min(screen.width() - 40.0);
-        let mut update = false;
-        let mut later = false;
-        egui::Area::new(id)
-            .order(egui::Order::Tooltip)
-            .fixed_pos(egui::pos2(screen.center().x - width / 2.0, screen.top() + 18.0))
-            .show(ctx, |ui| {
-                ui.set_width(width);
-                let frame = egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(24, 12, 36, 240))
-                    .stroke(Stroke::new(1.5_f32, look::ORANGE))
-                    .rounding(Rounding::same(14.0))
-                    .inner_margin(egui::Margin::symmetric(18.0, 14.0));
-                let r = frame.show(ui, |ui| {
-                    ui.set_width(width - 36.0);
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new("⬆  Update available").strong().size(18.0).color(look::ORANGE));
-                            ui.label(RichText::new(format!("{} has a new version.", p.name)).color(Color32::WHITE));
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if look::filter_pill(ui, "Later", false).clicked() {
-                                later = true;
-                            }
-                            if look::filter_pill(ui, "Update now", true).clicked() {
-                                update = true;
-                            }
-                        });
-                    });
-                });
-                // The glow goes on a layer under the notification.
-                let glow = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, id.with("glow")));
-                look::pill_glow(&glow, r.response.rect, look::ORANGE, 10.0, 0.35);
-            });
-        let slide = egui::emath::TSTransform::from_translation(Vec2::new(0.0, -(1.0 - eased) * 120.0));
-        ctx.set_transform_layer(egui::LayerId::new(egui::Order::Tooltip, id), slide);
-        ctx.set_transform_layer(egui::LayerId::new(egui::Order::Foreground, id.with("glow")), slide);
-        if a < 1.0 {
-            ctx.request_repaint();
-        }
-        if let Some(remote) = self.update_for(&p) {
-            if later {
-                self.saved.later.retain(|(r, _)| r != &p.repo);
-                self.saved.later.push((p.repo.clone(), remote));
-                self.notice = None;
-            }
-            if update {
-                self.saved.selected = Some(p.repo.clone());
-                self.notice = None;
-                self.start(ctx, p, Kind::Install);
-            }
-        }
-    }
-
-    /// Installed or not, and an update banner with Update now / Later.
-    fn install_box(&mut self, ui: &mut egui::Ui, p: &Project) {
-        let ctx = ui.ctx().clone();
-        let st = match self.state_of(&p.repo) {
-            Some(st) => st,
-            None => {
-                self.check_repo(&ctx, p);
-                RepoState { checking: true, ..Default::default() }
-            }
-        };
-        let running = self.job.lock().unwrap().running;
-        ui.horizontal_wrapped(|ui| {
-            if st.installed {
-                let v = st.built.as_deref().map(|c| &c[..c.len().min(7)]).unwrap_or("?");
-                look::tag(ui, &format!("✔ Installed (version {v})"), look::GREEN, true);
-            } else if st.checking {
-                ui.label(RichText::new("checking…").color(DIM));
-            } else {
-                look::tag(ui, "Not installed yet", look::RED, true);
-            }
-            if p.local_exe.is_none() && !st.checking && look::link(ui, "Check for updates").clicked() {
-                self.check_repo(&ctx, p);
-            }
-            if p.local_exe.is_none() && st.installed && ui.add_enabled(!running, egui::Button::new("Reinstall")).clicked() {
-                self.start(&ctx, p.clone(), Kind::Install);
-            }
-            if p.local_exe.is_none() && st.installed && !running {
-                let b = egui::Button::new(RichText::new("Uninstall").color(look::RED)).stroke(Stroke::new(1.0_f32, look::RED));
-                if ui.add(b).clicked() {
-                    self.confirm_uninstall = Some(p.repo.clone());
-                }
-            }
-        });
-        if let Some(remote) = self.update_for(p) {
-            egui::Frame::none()
-                .fill(ORANGE.gamma_multiply(0.15))
-                .stroke(Stroke::new(1.5_f32, ORANGE))
-                .rounding(Rounding::ZERO)
-                .inner_margin(10.0)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("⬆ Update available").strong().color(ORANGE));
-                        ui.label(RichText::new(format!("new version {}", &remote[..7])).color(DIM));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Later").clicked() {
-                                self.saved.later.retain(|(r, _)| r != &p.repo);
-                                self.saved.later.push((p.repo.clone(), remote.clone()));
-                            }
-                            let b = egui::Button::new(RichText::new("Update now").color(Color32::WHITE)).fill(PINK);
-                            if ui.add_enabled(!running, b).clicked() {
-                                self.start(&ctx, p.clone(), Kind::Install);
-                            }
-                        });
-                    });
-                });
-        }
-    }
-
-    /// The right side scrolls: a long description must not push the
-    /// status and log out of sight.
-    fn details(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .id_salt("details-scroll")
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-            .auto_shrink([false; 2])
-            .show(ui, |ui| self.details_inner(ui));
-    }
-
-    fn details_inner(&mut self, ui: &mut egui::Ui) {
-        match self.selected_project() {
-            Some(p) => {
-                look::gradient_title(ui, &p.name, 52.0, look::ORANGE, look::CORAL);
-                ui.hyperlink_to(format!("github.com/{}", p.repo), format!("https://github.com/{}", p.repo));
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    if let Some(f) = p.fps {
-                        look::tag(ui, &format!("ABOUT {f:.0} FPS (THEIR PC)"), look::GOLD, true);
-                    }
-                    if let Some(r) = p.render {
-                        look::tag(ui, &format!("RENDERING {:.0}%", r * 100.0), look::SKY, true);
-                    }
-                });
-                if p.gpu.iter().all(|g| !g.eq_ignore_ascii_case("nvidia")) && !p.gpu.is_empty() {
-                    ui.label(RichText::new("Made for AMD cards: it may not start on NVIDIA.").color(BAD));
-                }
-                ui.add_space(6.0);
-                self.install_box(ui, &p);
-                ui.add_space(6.0);
-                ui.label(RichText::new(&p.summary).color(TEXT));
-            }
-            None => {
-                ui.label(RichText::new("Pick a project on the left").size(22.0).color(DIM));
-            }
-        }
-        ui.add_space(10.0);
-        ui.separator();
-        let mut show_log = self.show_log;
-        let j = self.job.lock().unwrap();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Status").strong().size(18.0));
-            let color = if j.failed { BAD } else if j.running { ORANGE } else { look::GREEN };
-            ui.label(RichText::new(if j.stage.is_empty() { "Ready" } else { &j.stage }).color(color));
-            if j.running && !j.stage.is_empty() && j.stage != "Playing" {
-                ui.add(egui::Spinner::new().color(design::PINK));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if show_log { "Hide log" } else { "Show log" };
-                if ui.small_button(label).clicked() {
-                    show_log = !show_log;
-                }
-            });
-        });
-        if show_log || j.failed {
-            egui::ScrollArea::vertical()
-                .id_salt("log-scroll")
-                .max_height(260.0)
-                .stick_to_bottom(true)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                for line in j.log.iter().rev().take(400).rev() {
-                    ui.label(RichText::new(line).monospace().size(11.5).color(DIM));
-                }
-            });
-        }
-        drop(j);
-        self.show_log = show_log;
-    }
-
-    fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // A drive search that finished.
-        let done = {
-            let mut f = self.finding.lock().unwrap();
-            if matches!(&*f, Some(Some(_))) { f.take().flatten() } else { None }
-        };
-        if let Some(r) = done {
-            match r {
-                Ok(dir) => {
-                    self.saved.game_dir = dir;
-                    self.files.clear();
-                }
-                Err(e) => self.custom_error = Some(e),
-            }
-        }
-        let searching = matches!(&*self.finding.lock().unwrap(), Some(None));
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Game folder").strong());
-            let edit = egui::TextEdit::singleline(&mut self.saved.game_dir)
-                .hint_text("the folder with game_scarlett_master.exe")
-                .desired_width(300.0);
-            if ui.add(edit).changed() {
-                self.files.clear();
-            }
-            if ui.button("Browse…").clicked() {
-                if let Some(d) = rfd::FileDialog::new().set_title("The folder of your game files").pick_folder() {
-                    self.saved.game_dir = d.display().to_string();
-                    self.files.clear();
-                }
-            }
-            let label = if searching { "Searching…" } else { "🔍 Find it for me" };
-            if ui.add_enabled(!searching, egui::Button::new(RichText::new(label).color(TEAL))).clicked() {
-                *self.finding.lock().unwrap() = Some(None);
-                let (slot, ctx) = (self.finding.clone(), ctx.clone());
-                std::thread::spawn(move || {
-                    let r = search_drives();
-                    *slot.lock().unwrap() = Some(Some(r));
-                    ctx.request_repaint();
-                });
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            if self.saved.game_dir.is_empty() {
-                ui.label(RichText::new("Choose the folder of your game files, or press Find it for me.").color(ORANGE));
-            } else if self.files_ok() {
-                ui.label(RichText::new("✔ Game files found").color(GOOD).strong());
-            } else if self.empty {
-                ui.label(RichText::new("✘ This folder is empty: the game files are not here, so the game can't start. Press Find it for me.").color(BAD).strong());
-            } else {
-                ui.label(RichText::new("✘ You don't have the game files here, so the game can't start. Missing:").color(BAD).strong());
-                for (f, ok) in &self.files {
-                    if !ok {
-                        chip(ui, f, BAD);
-                    }
-                }
-            }
-            if self.tools.is_none() {
-                ui.label(RichText::new("checking tools…").color(DIM));
-            }
-        });
-        ui.add_space(18.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Graphics").strong().size(20.0));
-            look::tag(ui, "BETA", look::GOLD, false);
-        });
-        ui.label(
-            RichText::new("These graphics options are in beta: they may not work with every project or on older PCs. If a game will not start or looks wrong, switch back to Best quality and turn the fixes off.")
-                .color(DIM)
-                .size(13.0),
-        );
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Mode").strong());
-            let modes = [("Fast", true, 0.5_f32), ("Balanced", true, 0.75), ("Best quality", false, 1.0)];
-            for (name, s, scale) in modes {
-                let on = self.saved.series_s == s && (!s || (self.saved.render_scale - scale).abs() < 0.01);
-                let b = egui::Button::new(RichText::new(name).color(if on { Color32::WHITE } else { TEXT }))
-                    .fill(if on { PINK } else { CARD })
-                    .min_size(Vec2::new(110.0, 30.0));
-                if ui.add(b).clicked() {
-                    self.saved.series_s = s;
-                    self.saved.render_scale = scale;
-                }
-            }
-            ui.add_space(14.0);
-            ui.checkbox(&mut self.saved.fix_8gb, "8 GB graphics card fix (beta)");
-            ui.checkbox(&mut self.saved.bright_shadows, "Brighter shadows (beta)");
-        });
-        ui.add_space(10.0);
-        ui.checkbox(&mut self.saved.fullscreen, RichText::new("Fullscreen").strong());
-        ui.add_space(10.0);
-        let running = self.job.lock().unwrap().running;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Install folder").strong());
-            ui.label(RichText::new(workspace().display().to_string()).color(DIM));
-        });
-        ui.horizontal(|ui| {
-            let browse = ui.add_enabled(!running, egui::Button::new("Browse…"));
-            if browse.clicked() {
-                if let Some(d) = rfd::FileDialog::new().set_title("Where projects are downloaded and built").pick_folder() {
-                    self.choose_install_dir(d.join("Mandyhub"));
-                }
-            }
-            let default = ui.add_enabled(!running && !self.saved.install_dir.is_empty(), egui::Button::new("Default"));
-            if default.clicked() {
-                self.choose_install_dir(default_workspace());
-            }
-            ui.label(RichText::new("Projects take several GB each: a big drive is best.").color(DIM).size(13.0));
-        });
-        egui::CollapsingHeader::new(RichText::new("Advanced").color(DIM)).show(ui, |ui| {
-            ui.label(RichText::new("Extra switches for experts, one per line (VICTORY_NAME=value)").color(DIM));
-            ui.add(egui::TextEdit::multiline(&mut self.saved.extra_env).desired_rows(2).desired_width(500.0));
-        });
-        ui.add_space(26.0);
-        ui.separator();
-        ui.add_space(8.0);
-        ui.label(RichText::new("Credits").strong().size(20.0));
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Mandyhub by").color(Color32::WHITE));
-            look::gradient_title(ui, "Zettrox", 22.0, look::ORANGE, look::PINK);
-        });
-        ui.label(RichText::new("Project list from PortWatch (portwatch-vi.xyz). The projects are their authors' work, built on VIctory by Marvisak and its contributors.").color(DIM).size(13.0));
-        ui.label(RichText::new("No game files are included or downloaded: you need your own copy of the game.").color(DIM).size(13.0));
-    }
-
-    fn bottom(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // The game folder in one line; changing it is in Settings.
-        ui.horizontal(|ui| {
-            if self.files_ok() {
-                ui.label(RichText::new("✔ Game files found").color(GOOD).strong());
-                ui.label(RichText::new(&self.saved.game_dir).color(DIM).size(12.0));
-            } else {
-                ui.label(RichText::new("✘ Game files not found: the game can't start.").color(BAD).strong());
-                if ui.button(RichText::new("Choose the game folder").color(design::ORANGE)).clicked() {
-                    self.show_settings = true;
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mode = if !self.saved.series_s {
-                    "Best quality"
-                } else if self.saved.render_scale < 0.6 {
-                    "Fast"
-                } else {
-                    "Balanced"
-                };
-                ui.label(RichText::new(format!("Graphics: {mode}")).color(DIM));
-            });
-        });
-        ui.add_space(6.0);
-        self.tools_row(ui, ctx);
-        let tools_ok = self.tools.as_ref().is_some_and(|t| t.ready());
-        let running = self.job.lock().unwrap().running;
-        let selected = self.selected_project();
-        let installed = selected.as_ref().and_then(|p| self.state_of(&p.repo)).is_some_and(|st| st.installed);
-        // Playing needs the game files; installing needs Git and Rust.
-        let can = selected.is_some() && !running && if installed { self.files_ok() } else { tools_ok };
-        ui.horizontal(|ui| {
-            let (icon, label) = if running {
-                ("⏳", "RUNNING")
-            } else if installed {
-                ("▶", "PLAY")
-            } else {
-                ("⬇", "INSTALL")
-            };
-            if look::big_pill(ui, icon, label, can, running, design::time(ctx)).clicked() {
-                if let Some(p) = selected.clone() {
-                    self.start(ctx, p, if installed { Kind::Play } else { Kind::Install });
-                }
-            }
-            ui.add_space(10.0);
-            let why = if selected.is_none() {
-                "Pick a project first."
-            } else if installed && !self.files_ok() {
-                "The game files are missing."
-            } else if !installed && !tools_ok {
-                "Installing a project needs Git, Rust and the C++ build tools: press Install missing tools."
-            } else if installed {
-                "Starts the installed build. No game files are downloaded."
-            } else {
-                "Downloads and builds the project once, on this PC (several minutes). It stays installed."
-            };
-            ui.label(RichText::new(why).color(DIM));
-        });
     }
 }
