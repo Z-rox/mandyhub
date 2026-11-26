@@ -89,6 +89,8 @@ struct Saved {
     render_scale: f32,
     extra_env: String,
     gpu_filter: usize,
+    /// The branch picked for a project, by repo (none: the project's own).
+    branches: std::collections::HashMap<String, String>,
 }
 
 /// Shared state of the background job (download, build, play).
@@ -130,6 +132,25 @@ struct App {
     last_auto_check: f64,
     /// The project the update notification is about, while it shows.
     notice: Option<String>,
+    /// Each repo's branches online (`None` while being listed).
+    branch_lists: Arc<Mutex<std::collections::HashMap<String, Option<Result<Vec<String>, String>>>>>,
+}
+
+/// The branches of `repo` online (`git ls-remote --heads`, no download).
+fn remote_branches(repo: &str) -> Result<Vec<String>, String> {
+    let mut c = tools::git();
+    c.args(["ls-remote", "--heads"]).arg(format!("https://github.com/{repo}.git"));
+    hide_window(&mut c);
+    let out = c.output().map_err(|e| format!("git: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1)?.strip_prefix("refs/heads/").map(str::to_string))
+        .collect();
+    v.sort();
+    Ok(v)
 }
 
 /// How often installed projects are checked for updates: every 15 minutes.
@@ -490,6 +511,7 @@ impl App {
             slides: slides::Slides::new(),
             last_auto_check: -1.0,
             notice: None,
+            branch_lists: Arc::new(Mutex::new(std::collections::HashMap::new())),
         };
         if !app.saved.defaults_set {
             app.saved.defaults_set = true;
@@ -549,6 +571,13 @@ impl App {
         let mut v: Vec<Project> = self.saved.custom.clone();
         if let Some(Ok(list)) = &*self.projects.lock().unwrap() {
             v.extend(list.iter().cloned());
+        }
+        // The branch picked for a project replaces its own everywhere:
+        // download, update check and build.
+        for p in &mut v {
+            if let Some(b) = self.saved.branches.get(&p.repo) {
+                p.branch = Some(b.clone());
+            }
         }
         v
     }
@@ -1428,6 +1457,9 @@ impl App {
                 }
             }
         });
+        if p.local_exe.is_none() {
+            self.branch_picker(ui, p);
+        }
         if let Some(remote) = self.update_for(p) {
             egui::Frame::none()
                 .fill(ORANGE.gamma_multiply(0.15))
@@ -1450,6 +1482,65 @@ impl App {
                         });
                     });
                 });
+        }
+    }
+
+    /// Which branch of the project is downloaded and built. Picking another
+    /// one shows it as an update (Update now downloads and builds it).
+    fn branch_picker(&mut self, ui: &mut egui::Ui, p: &Project) {
+        let ctx = ui.ctx().clone();
+        let list = {
+            let mut m = self.branch_lists.lock().unwrap();
+            if !m.contains_key(&p.repo) {
+                m.insert(p.repo.clone(), None);
+                let (lists, ctx, repo) = (self.branch_lists.clone(), ctx.clone(), p.repo.clone());
+                std::thread::spawn(move || {
+                    let r = remote_branches(&repo);
+                    lists.lock().unwrap().insert(repo, Some(r));
+                    ctx.request_repaint();
+                });
+            }
+            m.get(&p.repo).cloned().flatten()
+        };
+        let picked = self.saved.branches.get(&p.repo).cloned();
+        let shown = picked.clone().unwrap_or_else(|| "Default".into());
+        let running = self.job.lock().unwrap().running;
+        let mut choice: Option<Option<String>> = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Branch").color(DIM));
+            match &list {
+                None => {
+                    ui.label(RichText::new("listing…").color(DIM));
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(format!("{shown} (branches not listed: {e})")).color(DIM));
+                }
+                Some(Ok(branches)) => {
+                    ui.add_enabled_ui(!running, |ui| {
+                        egui::ComboBox::from_id_salt(("branch", &p.repo)).selected_text(&shown).show_ui(ui, |ui| {
+                            if ui.selectable_label(picked.is_none(), "Default").clicked() {
+                                choice = Some(None);
+                            }
+                            for b in branches {
+                                if ui.selectable_label(picked.as_deref() == Some(b.as_str()), b).clicked() {
+                                    choice = Some(Some(b.clone()));
+                                }
+                            }
+                        });
+                    });
+                }
+            }
+        });
+        if let Some(c) = choice.filter(|c| *c != picked) {
+            match c {
+                Some(b) => self.saved.branches.insert(p.repo.clone(), b),
+                None => self.saved.branches.remove(&p.repo),
+            };
+            self.saved.later.retain(|(r, _)| r != &p.repo);
+            self.repos.lock().unwrap().remove(&p.repo);
+            if let Some(np) = self.selected_project().filter(|np| np.repo == p.repo) {
+                self.check_repo(&ctx, &np);
+            }
         }
     }
 
