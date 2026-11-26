@@ -1,7 +1,7 @@
-//! The background like a loading screen: big pictures that slowly zoom and
-//! drift, each fading into the next. The pictures are the player's own, from
-//! `%LOCALAPPDATA%\Mandyhub\backgrounds` (jpg or png); none ship with the
-//! launcher.
+//! The player's own pictures across the top of a project's page: each slowly
+//! drifts closer and fades into the next, and their lower part fades into the
+//! page's ground. They come from `%LOCALAPPDATA%\Mandyhub\backgrounds` (jpg or
+//! png); none ship with the launcher, and without any the page has no banner.
 
 use eframe::egui::{self, Color32, Pos2, Rect};
 use std::path::PathBuf;
@@ -48,36 +48,36 @@ impl Slides {
         Slides { decoded, textures: Vec::new() }
     }
 
-    /// Paints the pictures over the whole window at time `t`; false if there
-    /// are none (then the caller paints something else).
-    pub fn paint(&mut self, ctx: &egui::Context, t: f32) -> bool {
-        for (i, img) in self.decoded.lock().unwrap().drain(..).enumerate() {
-            let name = format!("slide-{}-{i}", self.textures.len());
+    /// Takes in the pictures read so far; true when there is one to show.
+    pub fn ready(&mut self, ctx: &egui::Context) -> bool {
+        for img in self.decoded.lock().unwrap().drain(..) {
+            let name = format!("slide-{}", self.textures.len());
             self.textures.push(ctx.load_texture(name, img, egui::TextureOptions::LINEAR));
         }
+        !self.textures.is_empty()
+    }
+
+    /// Paints the pictures into `rect` at time `t`, the lower part fading into `ground`.
+    pub fn paint_in(&self, painter: &egui::Painter, rect: Rect, t: f32, ground: Color32) {
         if self.textures.is_empty() {
-            return false;
+            return;
         }
-        let screen = ctx.screen_rect();
-        let painter = ctx.layer_painter(egui::LayerId::background());
-        painter.rect_filled(screen, 0.0, Color32::BLACK);
+        painter.rect_filled(rect, 0.0, ground);
         let n = self.textures.len();
-        let step = HOLD;
-        let k = (t / step).floor() as usize;
-        let local = t - k as f32 * step;
-        // The picture now, and the one before it while fading in.
+        let k = (t / HOLD).floor() as usize;
+        let local = t - k as f32 * HOLD;
+        // The picture now, and the one before it while this one fades in.
         let draw = |idx: usize, since: f32, alpha: f32| {
             let tex = &self.textures[idx % n];
             let [w, h] = tex.size();
-            let (img_aspect, scr_aspect) = (w as f32 / h as f32, screen.width() / screen.height());
-            // Cover the window: crop the picture to the window's shape.
-            let (mut uw, mut uh) = if img_aspect > scr_aspect { (scr_aspect / img_aspect, 1.0) } else { (1.0, img_aspect / scr_aspect) };
-            // Slowly closer: 100% to 88% of the picture over its time.
+            let (img_aspect, box_aspect) = (w as f32 / h as f32, rect.width() / rect.height());
+            // Cover the box: crop the picture to its shape.
+            let (mut uw, mut uh) = if img_aspect > box_aspect { (box_aspect / img_aspect, 1.0) } else { (1.0, img_aspect / box_aspect) };
+            // Slowly closer: 100% to 94% of the crop over its time.
             let p = (since / (HOLD + FADE)).clamp(0.0, 1.0);
-            let zoom = 1.0 - 0.12 * p;
+            let zoom = 1.0 - 0.06 * p;
             uw *= zoom;
             uh *= zoom;
-            // Drift: each picture toward its own corner.
             let dir = match idx % 4 {
                 0 => (1.0, 0.4),
                 1 => (-1.0, 0.3),
@@ -86,8 +86,7 @@ impl Slides {
             };
             let (cx, cy) = (0.5 + dir.0 * (1.0 - uw) * 0.5 * (p - 0.5), 0.5 + dir.1 * (1.0 - uh) * 0.5 * (p - 0.5));
             let uv = Rect::from_center_size(Pos2::new(cx, cy), egui::vec2(uw, uh));
-            let tint = Color32::from_white_alpha((alpha.clamp(0.0, 1.0) * 255.0) as u8);
-            painter.image(tex.id(), screen, uv, tint);
+            painter.image(tex.id(), rect, uv, Color32::from_white_alpha((alpha.clamp(0.0, 1.0) * 255.0) as u8));
         };
         if local < FADE && k > 0 {
             draw(k - 1, local + HOLD, 1.0);
@@ -95,27 +94,21 @@ impl Slides {
         } else {
             draw(k, local, 1.0);
         }
-        // Darker toward the top and bottom, a sunset tint over all: the
-        // panels stay readable over any picture.
+        // A light veil over the top, and the ground rising through the lower half.
+        let at = |a: u8| Color32::from_rgba_unmultiplied(ground.r(), ground.g(), ground.b(), a);
+        let stops = [(0.0, at(70)), (0.45, at(110)), (1.0, at(255))];
         let mut mesh = egui::Mesh::default();
-        let stops = [
-            (0.0, Color32::from_rgba_unmultiplied(10, 4, 24, 200)),
-            (0.35, Color32::from_rgba_unmultiplied(30, 8, 50, 90)),
-            (0.7, Color32::from_rgba_unmultiplied(60, 10, 60, 110)),
-            (1.0, Color32::from_rgba_unmultiplied(8, 2, 18, 230)),
-        ];
         for w in stops.windows(2) {
-            let (y0, c0) = (screen.top() + screen.height() * w[0].0, w[0].1);
-            let (y1, c1) = (screen.top() + screen.height() * w[1].0, w[1].1);
+            let (y0, c0) = (rect.top() + rect.height() * w[0].0, w[0].1);
+            let (y1, c1) = (rect.top() + rect.height() * w[1].0, w[1].1);
             let i = mesh.vertices.len() as u32;
-            mesh.colored_vertex(Pos2::new(screen.left(), y0), c0);
-            mesh.colored_vertex(Pos2::new(screen.right(), y0), c0);
-            mesh.colored_vertex(Pos2::new(screen.left(), y1), c1);
-            mesh.colored_vertex(Pos2::new(screen.right(), y1), c1);
+            mesh.colored_vertex(Pos2::new(rect.left(), y0), c0);
+            mesh.colored_vertex(Pos2::new(rect.right(), y0), c0);
+            mesh.colored_vertex(Pos2::new(rect.left(), y1), c1);
+            mesh.colored_vertex(Pos2::new(rect.right(), y1), c1);
             mesh.add_triangle(i, i + 1, i + 2);
             mesh.add_triangle(i + 1, i + 3, i + 2);
         }
         painter.add(egui::Shape::mesh(mesh));
-        true
     }
 }

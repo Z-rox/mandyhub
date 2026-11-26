@@ -2,6 +2,11 @@
 
 A community launcher for VIctory-based projects.
 
+**Play** opens the save picker. Continue a save, start fresh, copy an earlier
+save or a save from another build, or launch from a favorite checkpoint. To
+keep a reusable checkpoint, select a save, click **Add to favorites**, and name
+it. Each checkpoint launch uses a copy.
+
 - **Projects from PortWatch:** the list of public projects, live, with their reported frame rate, the graphics cards they were made for, and whether PortWatch has verified them.
 - **Custom repo links:** add any GitHub repo by its link.
 - **Install once, play many times:** a project is downloaded and built on your PC once and stays installed.
@@ -28,7 +33,11 @@ The launcher is `target\release\mandyhub.exe`.
 
 ## Backgrounds
 
-Put your own `.jpg` or `.png` pictures in `%LOCALAPPDATA%\Mandyhub\backgrounds`. They slowly move and fade into each other behind the launcher. Without pictures, an animated scene is shown.
+Put your own `.jpg` or `.png` pictures in `%LOCALAPPDATA%\Mandyhub\backgrounds`. They slowly move and fade into each other in a banner across the top of each project's page. Without pictures, the page has no banner.
+
+## Fonts
+
+The display type is Josefin Sans and Big Shoulders Display, built into the exe from `fonts/` under the SIL Open Font License (license texts in `fonts/`). Reading text and icons use Windows' own Segoe UI and Segoe Fluent Icons.
 
 ## Credits
 

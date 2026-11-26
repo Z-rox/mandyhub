@@ -25,6 +25,34 @@ pub fn keep_borderless(pid: u32) {
 #[cfg(not(windows))]
 pub fn keep_borderless(_pid: u32) {}
 
+/// Gives the launcher's own window (process `pid`) a dark title bar in the
+/// colours given. False until its window is up.
+#[cfg(windows)]
+pub fn dark_title_bar(pid: u32, caption: eframe::egui::Color32, text: eframe::egui::Color32) -> bool {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    };
+    let Some(hwnd) = find_window(pid) else { return false };
+    // COLORREF: 0x00BBGGRR.
+    let colorref = |c: eframe::egui::Color32| u32::from(c.r()) | u32::from(c.g()) << 8 | u32::from(c.b()) << 16;
+    let dark: i32 = 1;
+    let (caption, text) = (colorref(caption), colorref(text));
+    // SAFETY: a live window of this process; each value is the type and size its attribute takes.
+    // Windows 10 knows only the first; the colours are Windows 11's and are ignored before it.
+    unsafe {
+        DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32, &dark as *const i32 as *const _, 4);
+        DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR as u32, &caption as *const u32 as *const _, 4);
+        DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR as u32, &caption as *const u32 as *const _, 4);
+        DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR as u32, &text as *const u32 as *const _, 4);
+    }
+    true
+}
+
+#[cfg(not(windows))]
+pub fn dark_title_bar(_pid: u32, _caption: eframe::egui::Color32, _text: eframe::egui::Color32) -> bool {
+    true
+}
+
 #[cfg(windows)]
 use windows_sys::Win32::{Foundation::*, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
 
