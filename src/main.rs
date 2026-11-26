@@ -879,15 +879,46 @@ fn victory_env(c: &mut Command, p: &Project, l: &Launch) {
     }
 }
 
-/// Translates the game's shaders into `p`'s shader cache ahead of time
-/// (`victory translate --cache`), so a run does not stop to translate them
-/// while it plays; with `pipelines`, then builds the GPU pipelines too. The
-/// player can stop it.
+fn victory_help(exe: &Path, subcommand: &str) -> Option<String> {
+    let mut command = Command::new(exe);
+    command.args([subcommand, "--help"]);
+    hide_window(&mut command);
+    let output = command.output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Fills the same shader cache as Play, using the commands the installed fork exposes.
 fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch) -> Result<(), String> {
     let exe = project_exe(p)?;
     let files: Vec<PathBuf> = WARM_FILES.iter().map(|f| l.game_dir.join(f)).filter(|f| f.is_file()).collect();
     if files.is_empty() {
         return Err("the game files were not found: choose their folder in Settings".into());
+    }
+    let translate = victory_help(&exe, "translate");
+    let supports_flag = |help: &str, flag: &str| help.split_whitespace().any(|word| word == flag);
+    let translate_cache = translate.as_deref().filter(|help| supports_flag(help, "--cache"));
+    let mut commands = Vec::new();
+    let mut shaders = Command::new(&exe);
+    if let Some(help) = translate_cache {
+        shaders.args(["translate", "--cache"]);
+        if l.pipelines && supports_flag(help, "--pipelines") {
+            shaders.arg("--pipelines");
+        }
+    } else if victory_help(&exe, "shaders").is_some() {
+        shaders.arg("shaders");
+    } else {
+        return Err("This build offers neither translate --cache nor shaders for shader warm-up.".into());
+    }
+    shaders.args(&files);
+    commands.push(shaders);
+    if l.pipelines && !translate_cache.is_some_and(|help| supports_flag(help, "--pipelines")) {
+        if victory_help(&exe, "warm").is_some_and(|help| supports_flag(&help, "--used")) {
+            let mut pipelines = Command::new(&exe);
+            pipelines.args(["warm", "--used"]);
+            commands.push(pipelines);
+        } else {
+            job.lock().unwrap().log.push("This build does not expose a supported pipeline warm-up. Warming shaders only.".into());
+        }
     }
     stage(
         job,
@@ -898,21 +929,22 @@ fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch) -> 
             "Warming up shaders (the first time takes minutes)"
         },
     );
-    let mut c = Command::new(&exe);
-    c.args(["translate", "--cache"]);
-    if l.pipelines {
-        c.arg("--pipelines");
+    for mut command in commands {
+        victory_env(&mut command, p, l);
+        job.lock().unwrap().stoppable = true;
+        let result = run_with(job, ctx, &mut command, |pid| job.lock().unwrap().pid = Some(pid));
+        let stopped = {
+            let mut j = job.lock().unwrap();
+            j.stoppable = false;
+            j.pid = None;
+            j.stopped
+        };
+        if stopped {
+            return Err("stopped".into());
+        }
+        result?;
     }
-    c.args(&files);
-    victory_env(&mut c, p, l);
-    job.lock().unwrap().stoppable = true;
-    let r = run_with(job, ctx, &mut c, |pid| job.lock().unwrap().pid = Some(pid));
-    {
-        let mut j = job.lock().unwrap();
-        j.stoppable = false;
-        j.pid = None;
-    }
-    r.map_err(|e| format!("{e} (builds from before VIctory's `translate --cache` have no warm-up)"))
+    Ok(())
 }
 
 /// Starts the installed build of `p`, warming its shaders first when the player asked for that.
