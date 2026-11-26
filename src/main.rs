@@ -100,6 +100,14 @@ struct Job {
     stage: String,
     log: Vec<String>,
     failed: bool,
+    /// When the job began and, once it is over, when it ended.
+    started: Option<std::time::Instant>,
+    ended: Option<std::time::Instant>,
+    /// The stage the job is in and how many it has (0 when it has no steps).
+    step: u32,
+    steps: u32,
+    /// The crates cargo has compiled so far.
+    compiled: u32,
 }
 
 struct App {
@@ -611,7 +619,8 @@ impl App {
             if j.running {
                 return;
             }
-            *j = Job { running: true, stage: "Starting".into(), repo: Some(p.repo.clone()), ..Default::default() };
+            let steps = if kind == Kind::Install { 2 } else { 0 };
+            *j = Job { running: true, stage: "Starting".into(), repo: Some(p.repo.clone()), started: Some(std::time::Instant::now()), steps, ..Default::default() };
         }
         // An install over an installed project is an update.
         let updating = kind == Kind::Install && built_exe(&p.repo).is_file();
@@ -636,6 +645,7 @@ impl App {
             {
                 let mut j = job.lock().unwrap();
                 j.running = false;
+                j.ended = Some(std::time::Instant::now());
                 match r {
                     Ok(()) => {
                         j.stage = match kind {
@@ -669,6 +679,7 @@ impl App {
 fn stage(job: &Arc<Mutex<Job>>, ctx: &egui::Context, s: &str) {
     let mut j = job.lock().unwrap();
     j.stage = s.to_string();
+    j.step += 1;
     j.log.push(format!("== {s}"));
     ctx.request_repaint();
 }
@@ -802,6 +813,9 @@ fn run_with(job: &Arc<Mutex<Job>>, ctx: &egui::Context, c: &mut Command, spawned
         std::thread::spawn(move || {
             for line in BufReader::new(r).lines().map_while(Result::ok) {
                 let mut j = job.lock().unwrap();
+                if line.trim_start().starts_with("Compiling ") {
+                    j.compiled += 1;
+                }
                 j.log.push(line);
                 if j.log.len() > 4000 {
                     j.log.drain(..1000);
@@ -848,6 +862,34 @@ fn style(ctx: &egui::Context) {
     s.spacing.button_padding = Vec2::new(14.0, 8.0);
     ctx.set_style(s);
     design::text_sizes(ctx);
+}
+
+/// A log line's color: stage markers and errors stand out, warnings are gold.
+fn log_color(line: &str) -> Color32 {
+    let l = line.trim_start();
+    if l.starts_with("ERROR") || l.starts_with("error") {
+        BAD
+    } else if l.starts_with("== ") {
+        ORANGE
+    } else if l.starts_with("warning") {
+        look::GOLD
+    } else {
+        DIM
+    }
+}
+
+/// "Step 1 of 2  ·  0:42  ·  87 crates compiled": the step only while the job
+/// runs and has several, "took" once it is over, the crates once any compiled.
+fn progress_text(running: bool, step: u32, steps: u32, secs: u64, compiled: u32) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if running && steps > 1 && step > 0 {
+        parts.push(format!("Step {} of {steps}", step.min(steps)));
+    }
+    parts.push(format!("{}{}:{:02}", if running { "" } else { "took " }, secs / 60, secs % 60));
+    if compiled > 0 {
+        parts.push(format!("{compiled} crates compiled"));
+    }
+    parts.join("  ·  ")
 }
 
 fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
@@ -1204,7 +1246,7 @@ impl App {
             if j.running {
                 return;
             }
-            *j = Job { running: true, stage: "Installing tools (Windows will ask for permission)".into(), ..Default::default() };
+            *j = Job { running: true, stage: "Installing tools (Windows will ask for permission)".into(), started: Some(std::time::Instant::now()), ..Default::default() };
         }
         self.show_log = true;
         let ctx = ctx.clone();
@@ -1493,6 +1535,10 @@ impl App {
         ui.separator();
         let mut show_log = self.show_log;
         let j = self.job.lock().unwrap();
+        // The timer needs a repaint every second while the job runs.
+        if j.running {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
         ui.horizontal(|ui| {
             ui.label(RichText::new("Status").strong().size(18.0));
             let color = if j.failed { BAD } else if j.running { ORANGE } else { look::GREEN };
@@ -1505,8 +1551,28 @@ impl App {
                 if ui.small_button(label).clicked() {
                     show_log = !show_log;
                 }
+                if !j.log.is_empty() && ui.small_button("Copy log").clicked() {
+                    ui.ctx().copy_text(j.log.join("\n"));
+                }
             });
         });
+        // "Step 1 of 2 · 0:42 · 87 crates compiled", for a job that has started.
+        if let Some(started) = j.started {
+            let secs = j.ended.unwrap_or_else(std::time::Instant::now).duration_since(started).as_secs();
+            ui.label(RichText::new(progress_text(j.running, j.step, j.steps, secs, j.compiled)).color(DIM).size(12.5));
+        }
+        // What the job is doing right now, while the log is closed.
+        if j.running && !show_log {
+            if let Some(line) = j.log.iter().rev().find(|l| !l.starts_with("== ") && !l.trim().is_empty()) {
+                ui.label(RichText::new(line.trim()).monospace().size(11.5).color(DIM));
+            }
+        }
+        if j.failed {
+            if let Some(e) = j.log.iter().rev().find(|l| l.starts_with("ERROR")) {
+                ui.add_space(4.0);
+                ui.label(RichText::new(e).color(BAD));
+            }
+        }
         if show_log || j.failed {
             egui::ScrollArea::vertical()
                 .id_salt("log-scroll")
@@ -1515,7 +1581,7 @@ impl App {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                 for line in j.log.iter().rev().take(400).rev() {
-                    ui.label(RichText::new(line).monospace().size(11.5).color(DIM));
+                    ui.label(RichText::new(line).monospace().size(11.5).color(log_color(line)));
                 }
             });
         }
@@ -1707,5 +1773,41 @@ impl App {
             };
             ui.label(RichText::new(why).color(DIM));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_lines_get_their_color() {
+        assert_eq!(log_color("ERROR: it broke"), BAD);
+        assert_eq!(log_color("error[E0432]: unresolved import"), BAD);
+        assert_eq!(log_color("   error: could not compile"), BAD);
+        assert_eq!(log_color("== Building"), ORANGE);
+        assert_eq!(log_color("warning: unused variable"), look::GOLD);
+        assert_eq!(log_color("   Compiling serde v1.0.0"), DIM);
+        assert_eq!(log_color(""), DIM);
+    }
+
+    #[test]
+    fn progress_shows_the_step_only_while_running() {
+        assert_eq!(progress_text(true, 1, 2, 42, 0), "Step 1 of 2  ·  0:42");
+        assert_eq!(progress_text(true, 2, 2, 125, 87), "Step 2 of 2  ·  2:05  ·  87 crates compiled");
+        assert_eq!(progress_text(false, 2, 2, 252, 87), "took 4:12  ·  87 crates compiled");
+    }
+
+    #[test]
+    fn progress_skips_the_step_for_jobs_without_steps() {
+        // Play and uninstall have no steps; "Starting" is step 0.
+        assert_eq!(progress_text(true, 1, 0, 3, 0), "0:03");
+        assert_eq!(progress_text(true, 1, 1, 3, 0), "0:03");
+        assert_eq!(progress_text(true, 0, 2, 1, 0), "0:01");
+    }
+
+    #[test]
+    fn the_step_never_passes_the_last() {
+        assert_eq!(progress_text(true, 5, 2, 0, 0), "Step 2 of 2  ·  0:00");
     }
 }
