@@ -166,8 +166,59 @@ fn target_dir(repo: &str) -> PathBuf {
 }
 fn built_exe(repo: &str) -> PathBuf {
     let dir = repo_dir(repo);
-    let profile = detect_build_profile(&dir);
-    target_dir(repo).join(profile).join("victory.exe")
+    let workspace = cargo_workspace(&dir).unwrap_or_else(|_| dir.clone());
+    let target = target_dir(repo);
+    let executable = target.join(detect_build_profile(&workspace)).join("victory.exe");
+    let previous = target.join("release").join("victory.exe");
+    if workspace != dir && !executable.is_file() && previous.is_file() {
+        return previous;
+    }
+    executable
+}
+
+/// Most projects build at the root. Some wrap a VIctory workspace one level down.
+fn cargo_workspace(repo: &Path) -> Result<PathBuf, String> {
+    if repo.join("Cargo.toml").is_file() {
+        return Ok(repo.to_owned());
+    }
+    let entries = std::fs::read_dir(repo).map_err(|error| format!("Could not inspect {}: {error}", repo.display()))?;
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Could not inspect {}: {error}", repo.display()))?;
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && path.join("Cargo.toml").is_file()
+            && path.join("apps/victory/Cargo.toml").is_file()
+        {
+            matches.push(path);
+        }
+    }
+    match matches.as_slice() {
+        [workspace] => Ok(workspace.clone()),
+        [] => Err(format!("No Cargo.toml at {} and no nested VIctory workspace found.", repo.display())),
+        _ => Err(format!("Multiple nested VIctory workspaces found in {}.", repo.display())),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn finds_a_unique_nested_victory_workspace_and_prefers_the_root() {
+    let root = std::env::temp_dir().join(format!("mandyhub-workspace-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let nested = root.join("cool_fox");
+    std::fs::create_dir_all(nested.join("apps/victory")).unwrap();
+    std::fs::write(nested.join("Cargo.toml"), "[profile.diag]").unwrap();
+    std::fs::write(nested.join("apps/victory/Cargo.toml"), "").unwrap();
+    assert_eq!(cargo_workspace(&root).unwrap(), nested);
+    assert_eq!(detect_build_profile(&nested), "diag");
+    let other = root.join("other");
+    std::fs::create_dir_all(other.join("apps/victory")).unwrap();
+    std::fs::write(other.join("Cargo.toml"), "").unwrap();
+    std::fs::write(other.join("apps/victory/Cargo.toml"), "").unwrap();
+    assert!(cargo_workspace(&root).is_err());
+    std::fs::write(root.join("Cargo.toml"), "").unwrap();
+    assert_eq!(cargo_workspace(&root).unwrap(), root);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Checks a cloned repo's Cargo.toml for a custom build profile (e.g. `diag`).
@@ -697,18 +748,20 @@ fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project) -> Result<()
     }
     stage(job, ctx, "Building (the first time takes several minutes)");
     let target = target_dir(&p.repo);
-    let profile = detect_build_profile(&dir);
-    let has_lockfile = dir.join("Cargo.lock").is_file();
+    let workspace = cargo_workspace(&dir)?;
+    let profile = detect_build_profile(&workspace);
+    let has_lockfile = workspace.join("Cargo.lock").is_file();
     let mut cargo = tools::cargo();
     cargo.args(["build", "--profile", profile, "-p", "victory", "--target-dir"]);
     cargo.arg(&target);
     if has_lockfile {
         cargo.arg("--locked");
     }
-    cargo.current_dir(&dir);
+    cargo.current_dir(&workspace);
     run(job, ctx, &mut cargo)?;
-    if !built_exe(&p.repo).is_file() {
-        return Err(format!("the build made no {}", built_exe(&p.repo).display()));
+    let executable = target.join(profile).join("victory.exe");
+    if !executable.is_file() {
+        return Err(format!("the build made no {}", executable.display()));
     }
     let mut c = tools::git();
     c.args(["rev-parse", "HEAD"]).current_dir(&dir);
