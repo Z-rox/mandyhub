@@ -161,6 +161,8 @@ struct App {
     slides: slides::Slides,
     /// A newer Mandyhub on GitHub, if one was found (selfupdate.rs).
     selfup: Arc<Mutex<selfupdate::SelfUpdate>>,
+    /// Descriptions of custom repos, fetched from their sites (etch_about).
+    about: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// When every installed project was last checked for updates (seconds).
     last_auto_check: f64,
     /// The project the update notification is about, while it shows.
@@ -252,7 +254,9 @@ fn detect_build_profile(repo_dir: &Path) -> &'static str {
 fn detect_launch_env(repo_dir: &Path) -> Vec<(String, String)> {
     let script = repo_dir.join("scripts").join("play.ps1");
     let Ok(text) = std::fs::read_to_string(&script) else {
-        return Vec::new();
+        // Some projects keep their tuned settings in a Windows batch file
+        // (Play-*.cmd or .bat in the repo's top folder) instead.
+        return detect_cmd_env(repo_dir);
     };
     let mut vars = Vec::new();
     // Parse PowerShell hashtable lines like: VICTORY_FOO = '1'; VICTORY_BAR = '2'
@@ -273,6 +277,55 @@ fn detect_launch_env(repo_dir: &Path) -> Vec<(String, String)> {
     }
     vars
 }
+/// Reads `set "VICTORY_NAME=value"` lines from a project's `Play*.cmd` / `Play*.bat`
+/// (as in `if not defined VICTORY_NAME set "VICTORY_NAME=1"`). Values that name
+/// another variable (`%...%`) are skipped, as are the ones the launcher sets itself
+/// (game folder, program to run, data and cache folders).
+fn detect_cmd_env(repo_dir: &Path) -> Vec<(String, String)> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(repo_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+            name.starts_with("play") && (name.ends_with(".cmd") || name.ends_with(".bat"))
+        })
+        .collect();
+    files.sort();
+    let mut vars: Vec<(String, String)> = Vec::new();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        vars.extend(parse_cmd_env(&text));
+    }
+    vars
+}
+
+fn parse_cmd_env(text: &str) -> Vec<(String, String)> {
+    const OWN: [&str; 6] =
+        ["VICTORY_GAME_DIR", "VICTORY_RUNNER", "VICTORY_DATA_DIR", "VICTORY_CACHE_DIR", "VICTORY_CONSOLE", "VICTORY_KEYS"];
+    let mut vars: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.to_ascii_lowercase().starts_with("rem ") || line.starts_with("::") {
+            continue;
+        }
+        // Everything after `set "` up to the closing quote.
+        let lower = line.to_ascii_lowercase();
+        let Some(at) = lower.find("set \"") else { continue };
+        let rest = &line[at + 5..];
+        let Some(end) = rest.rfind('"') else { continue };
+        let Some((k, v)) = rest[..end].split_once('=') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        if k.starts_with("VICTORY_") && !k.contains(' ') && !v.contains('%') && !OWN.contains(&k) {
+            // The last assignment of a name wins, as in the batch file.
+            vars.retain(|(name, _)| name != k);
+            vars.push((k.to_string(), v.to_string()));
+        }
+    }
+    vars
+}
+
 /// The commit an installed build was made from, written after a build.
 fn built_file(repo: &str) -> PathBuf {
     target_dir(repo).join("built-from.txt")
@@ -730,6 +783,7 @@ impl App {
             show_log: false,
             slides: slides::Slides::new(),
             selfup: Arc::new(Mutex::new(selfupdate::SelfUpdate::default())),
+            about: Arc::new(Mutex::new(std::collections::HashMap::new())),
             last_auto_check: -1.0,
             notice: None,
         };
@@ -743,6 +797,7 @@ impl App {
         set_install_dir(&app.saved.install_dir);
         app.refresh_projects(&cc.egui_ctx);
         selfupdate::check(app.selfup.clone(), cc.egui_ctx.clone());
+        app.fetch_about(&cc.egui_ctx);
         let ctx = cc.egui_ctx.clone();
         let job = app.job.clone();
         std::thread::spawn(move || {
@@ -799,10 +854,57 @@ impl App {
 
     fn all_projects(&self) -> Vec<Project> {
         let mut v: Vec<Project> = self.saved.custom.clone();
+        let about = self.about.lock().unwrap();
         if let Some(Ok(list)) = &*self.projects.lock().unwrap() {
-            v.extend(list.iter().cloned());
+            // A custom repo that is also on the list shows the list's data (fps, GPU,
+            // verified, description) and stays custom; the list's copy is not shown twice.
+            let same = |a: &Project, b: &Project| a.repo.eq_ignore_ascii_case(&b.repo) && a.host == b.host;
+            for c in v.iter_mut() {
+                if let Some(l) = list.iter().find(|l| same(l, c)) {
+                    c.gpu = l.gpu.clone();
+                    c.fps = l.fps;
+                    c.render = l.render;
+                    c.verified = l.verified;
+                    c.summary = l.summary.clone();
+                    if c.branch.is_none() {
+                        c.branch = l.branch.clone();
+                    }
+                }
+            }
+            let custom = v.clone();
+            v.extend(list.iter().filter(|l| !custom.iter().any(|c| same(c, l))).cloned());
+        }
+        // Not on the list: the repo's own description from its site (fetched at start and on add).
+        for c in v.iter_mut().filter(|p| p.custom && p.summary == "Added by link.") {
+            if let Some(d) = about.get(&c.repo) {
+                c.summary = d.clone();
+            }
         }
         v
+    }
+
+    /// Fetches the description of each custom repo from its site (GitHub or a Gitea server).
+    fn fetch_about(&self, ctx: &egui::Context) {
+        let (about, ctx) = (self.about.clone(), ctx.clone());
+        let repos: Vec<(Option<String>, String)> = self.saved.custom.iter().map(|p| (p.host.clone(), p.repo.clone())).collect();
+        std::thread::spawn(move || {
+            for (host, repo) in repos {
+                if about.lock().unwrap().contains_key(&repo) {
+                    continue;
+                }
+                let url = match &host {
+                    None => format!("https://api.github.com/repos/{repo}"),
+                    Some(h) => format!("{h}/api/v1/repos/{repo}"),
+                };
+                let Ok(r) = ureq::get(&url).set("User-Agent", "mandyhub").call() else { continue };
+                let Ok(j) = r.into_json::<serde_json::Value>() else { continue };
+                let d = clean_text(j["description"].as_str().unwrap_or("").trim());
+                if !d.is_empty() {
+                    about.lock().unwrap().insert(repo, d);
+                    ctx.request_repaint();
+                }
+            }
+        });
     }
 
     fn selected_project(&self) -> Option<Project> {
@@ -983,6 +1085,14 @@ fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project) -> Result<()
         return Err("this repo is not a Rust project (no Cargo.toml): Mandyhub cannot build it".into());
     }
     let victory = is_victory(&dir);
+    // Projects with a native engine built by a script first (Kelvaroq: scripts/build_native.py).
+    let native = dir.join("scripts").join("build_native.py");
+    if !victory && native.is_file() {
+        stage(job, ctx, "Building the project's native engine (scripts/build_native.py)");
+        let mut py = Command::new("python");
+        py.arg(&native).current_dir(&dir);
+        run(job, ctx, &mut py).map_err(|e| format!("{e} (this project needs Python: python.org, or 'winget install Python.Python.3.12')"))?;
+    }
     let note = target.join("built-exe.txt");
     let _ = std::fs::remove_file(&note);
     let mut cargo = tools::cargo();
@@ -1438,6 +1548,7 @@ impl eframe::App for App {
                             self.saved.selected = Some(repo.clone());
                             self.custom_link.clear();
                             self.confirm_custom = None;
+                            self.fetch_about(ctx);
                         }
                         if ui.button("Cancel").clicked() {
                             self.confirm_custom = None;
@@ -2425,5 +2536,32 @@ mod link_tests {
         assert_eq!(parse_link("ftp://site.org/a/b"), None);
         assert_eq!(parse_link("not a link"), None);
         assert_eq!(parse_link("https://site.org/onlyone"), None);
+    }
+}
+
+#[cfg(test)]
+mod cmd_env_tests {
+    use super::parse_cmd_env;
+
+    #[test]
+    fn reads_set_lines_and_skips_the_launcher_own_ones() {
+        let lines = [
+            "@echo off",
+            r#"rem set "VICTORY_SKIPPED=1""#,
+            r#"if not defined VICTORY_RELAY set "VICTORY_RELAY=2""#,
+            r#"if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\x""#,
+            r#"if not defined VICTORY_GAME_DIR set "VICTORY_GAME_DIR=C:\game""#,
+            r#"set "VICTORY_XMEM_SECTION_KB=20000-21000""#,
+            r#"set "VICTORY_RELAY=3""#,
+            r#"set "OTHER=1""#,
+        ];
+        let vars = parse_cmd_env(&lines.join("\r\n"));
+        assert_eq!(
+            vars,
+            vec![
+                ("VICTORY_XMEM_SECTION_KB".to_string(), "20000-21000".to_string()),
+                ("VICTORY_RELAY".to_string(), "3".to_string()),
+            ]
+        );
     }
 }

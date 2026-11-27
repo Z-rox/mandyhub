@@ -1,6 +1,6 @@
 [package]
 name = "mandyhub"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Mandyhub: a community launcher for VIctory-based projects: pick a repo from PortWatch or a custom link, check the game files, build and play."
 license = "GPL-3.0-or-later"
